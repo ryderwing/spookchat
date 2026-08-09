@@ -7443,35 +7443,3 @@ def index():
 # ============================================================
 
 init_database()
-
-
-if __name__ == "__main__":
-
-    print()
-    print("=" * 60)
-    print("SPOOKCHAT")
-    print("=" * 60)
-
-    print(
-        "Website: http://127.0.0.1:5000"
-    )
-
-    print(
-        "Owner:",
-        OWNER_USERNAME
-    )
-
-    print(
-        "Real-time chat: ENABLED"
-    )
-
-    print("=" * 60)
-    print()
-
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-        allow_unsafe_werkzeug=True
-    )
