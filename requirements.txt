@@ -1,6 +1,5 @@
 Flask
-flask-cors
+Flask-Cors
+Flask-SocketIO
 Werkzeug
-gunicorn
-flask-socketio
 simple-websocket
