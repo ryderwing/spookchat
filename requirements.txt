@@ -1,5 +1,6 @@
-Flask
-Flask-Cors
-Flask-SocketIO
-Werkzeug
-simple-websocket
+Flask>=3.0,<4
+Flask-Cors>=4.0,<7
+Flask-SocketIO>=5.3,<6
+simple-websocket>=1.0,<2
+Werkzeug>=3.0,<4
+gunicorn>=22,<24
