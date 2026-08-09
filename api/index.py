@@ -18,7 +18,7 @@ APP_NAME = "SpookChat"
 
 DATABASE = os.environ.get(
     "SPOOKCHAT_DATABASE",
-    "spookchat.db"
+    "/tmp/spookchat.db"
 )
 
 OWNER_USERNAME = os.environ.get(
