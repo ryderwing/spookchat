@@ -6,6 +6,7 @@ from functools import wraps
 
 from flask import Flask, jsonify, request, render_template_string
 from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
 
 
@@ -25,14 +26,6 @@ OWNER_USERNAME = os.environ.get(
     "JAYDEN"
 )
 
-# IMPORTANT:
-# Your old script had:
-#
-# os.environ.get("2011BeT20211", "")
-#
-# which was incorrect.
-#
-# This uses SPOOKCHAT_OWNER_PASSWORD correctly.
 OWNER_PASSWORD = os.environ.get(
     "SPOOKCHAT_OWNER_PASSWORD",
     ""
@@ -41,7 +34,21 @@ OWNER_PASSWORD = os.environ.get(
 ONLINE_SECONDS = 60
 
 app = Flask(__name__)
-CORS(app)
+
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": "*"
+        }
+    }
+)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading"
+)
 
 ROLES = {
     "user": 0,
@@ -60,13 +67,26 @@ def now():
 
 
 def db():
-    connection = sqlite3.connect(DATABASE)
+    connection = sqlite3.connect(
+        DATABASE,
+        timeout=30
+    )
+
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+
+    connection.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
     return connection
 
 
-def add_column_if_missing(connection, table, column, definition):
+def add_column_if_missing(
+    connection,
+    table,
+    column,
+    definition
+):
     columns = connection.execute(
         f"PRAGMA table_info({table})"
     ).fetchall()
@@ -78,11 +98,15 @@ def add_column_if_missing(connection, table, column, definition):
 
     if column not in existing:
         connection.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            f"""
+            ALTER TABLE {table}
+            ADD COLUMN {column} {definition}
+            """
         )
 
 
 def init_database():
+
     connection = db()
 
     connection.execute("""
@@ -167,93 +191,27 @@ def init_database():
         )
     """)
 
-    # -------------------------
     # Migrations
-    # -------------------------
+    migrations = [
+        ("users", "ip", "TEXT DEFAULT 'unknown'"),
+        ("users", "role", "TEXT DEFAULT 'user'"),
+        ("users", "show_role_tag", "INTEGER DEFAULT 1"),
+        ("users", "banned", "INTEGER DEFAULT 0"),
+        ("users", "pfp", "TEXT DEFAULT ''"),
+        ("users", "description", "TEXT DEFAULT ''"),
+        ("users", "pronouns", "TEXT DEFAULT ''"),
+        ("users", "created_at", "TEXT DEFAULT ''"),
+        ("users", "last_seen", "TEXT DEFAULT ''"),
+        ("messages", "edited", "INTEGER DEFAULT 0"),
+        ("messages", "edited_at", "TEXT DEFAULT ''"),
+        ("reports", "moderator_note", "TEXT DEFAULT ''")
+    ]
 
-    add_column_if_missing(
-        connection,
-        "users",
-        "ip",
-        "TEXT DEFAULT 'unknown'"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "role",
-        "TEXT DEFAULT 'user'"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "show_role_tag",
-        "INTEGER DEFAULT 1"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "banned",
-        "INTEGER DEFAULT 0"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "pfp",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "description",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "pronouns",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "created_at",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "users",
-        "last_seen",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "messages",
-        "edited",
-        "INTEGER DEFAULT 0"
-    )
-
-    add_column_if_missing(
-        connection,
-        "messages",
-        "edited_at",
-        "TEXT DEFAULT ''"
-    )
-
-    add_column_if_missing(
-        connection,
-        "reports",
-        "moderator_note",
-        "TEXT DEFAULT ''"
-    )
+    for migration in migrations:
+        add_column_if_missing(
+            connection,
+            *migration
+        )
 
     connection.execute("""
         UPDATE users
@@ -273,10 +231,7 @@ def init_database():
         WHERE banned IS NULL
     """)
 
-    # -------------------------
-    # Ensure owner exists
-    # -------------------------
-
+    # Owner
     owner = connection.execute("""
         SELECT *
         FROM users
@@ -298,9 +253,8 @@ def init_database():
             owner["id"],
         ))
 
-        # If the supplied owner password is set,
-        # make sure the owner can actually log in.
         if OWNER_PASSWORD:
+
             connection.execute("""
                 UPDATE users
                 SET password=?
@@ -350,18 +304,19 @@ def init_database():
             now()
         ))
 
-    # -------------------------
-    # Indexes
-    # -------------------------
-
     connection.execute("""
         CREATE INDEX IF NOT EXISTS idx_messages_user
         ON messages(user_id)
     """)
 
     connection.execute("""
-        CREATE INDEX IF NOT EXISTS idx_reports_status
-        ON reports(status)
+        CREATE INDEX IF NOT EXISTS idx_private_messages_sender
+        ON private_messages(sender_id)
+    """)
+
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_private_messages_receiver
+        ON private_messages(receiver_id)
     """)
 
     connection.execute("""
@@ -374,6 +329,11 @@ def init_database():
         ON friendships(friend_id)
     """)
 
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_reports_status
+        ON reports(status)
+    """)
+
     connection.commit()
     connection.close()
 
@@ -383,6 +343,7 @@ def init_database():
 # ============================================================
 
 def current_ip():
+
     forwarded = request.headers.get(
         "X-Forwarded-For"
     )
@@ -394,6 +355,7 @@ def current_ip():
 
 
 def get_user():
+
     token = request.headers.get(
         "Authorization",
         ""
@@ -420,12 +382,17 @@ def get_user():
 
 
 def is_online(last_seen):
+
     if not last_seen:
         return False
 
     try:
+
         timestamp = datetime.fromisoformat(
-            last_seen.replace("Z", "+00:00")
+            last_seen.replace(
+                "Z",
+                "+00:00"
+            )
         )
 
         age = (
@@ -470,6 +437,7 @@ def require_user(function):
             ip_banned
             and user["role"] != "owner"
         ):
+
             connection.close()
 
             return jsonify(
@@ -547,6 +515,7 @@ def require_role(required_role):
 # ============================================================
 
 def public_user(user):
+
     return {
         "id": user["id"],
         "username": user["username"],
@@ -586,7 +555,11 @@ def user_json(row):
     }
 
 
-def are_friends(connection, first, second):
+def are_friends(
+    connection,
+    first,
+    second
+):
 
     result = connection.execute("""
         SELECT id
@@ -641,6 +614,100 @@ def get_friend_status(
     return "received"
 
 
+def message_object(connection, message_id, owner_id=None):
+
+    row = connection.execute("""
+        SELECT
+            messages.id,
+            messages.user_id,
+            users.username,
+            users.role,
+            users.show_role_tag,
+            users.pfp,
+            users.last_seen,
+            messages.message,
+            messages.edited,
+            messages.edited_at,
+            messages.created_at
+        FROM messages
+        JOIN users
+            ON users.id=messages.user_id
+        WHERE messages.id=?
+    """, (
+        message_id,
+    )).fetchone()
+
+    if not row:
+        return None
+
+    result = dict(row)
+
+    result["online"] = is_online(
+        row["last_seen"]
+    )
+
+    if owner_id is not None:
+        result["is_owner"] = (
+            row["user_id"] == owner_id
+        )
+
+    return result
+
+
+# ============================================================
+# SOCKET.IO
+# ============================================================
+
+@socketio.on("connect")
+def socket_connect(auth=None):
+
+    print(
+        "SpookChat realtime connection"
+    )
+
+
+@socketio.on("disconnect")
+def socket_disconnect():
+
+    print(
+        "SpookChat realtime disconnected"
+    )
+
+
+@socketio.on("join_dm")
+def socket_join_dm(data):
+
+    try:
+
+        user_id = int(
+            data.get("user_id")
+        )
+
+        join_room(
+            f"dm_{user_id}"
+        )
+
+    except Exception:
+        pass
+
+
+@socketio.on("leave_dm")
+def socket_leave_dm(data):
+
+    try:
+
+        user_id = int(
+            data.get("user_id")
+        )
+
+        leave_room(
+            f"dm_{user_id}"
+        )
+
+    except Exception:
+        pass
+
+
 # ============================================================
 # AUTH API
 # ============================================================
@@ -653,11 +720,17 @@ def register():
     ) or {}
 
     username = str(
-        data.get("username", "")
+        data.get(
+            "username",
+            ""
+        )
     ).strip()
 
     password = str(
-        data.get("password", "")
+        data.get(
+            "password",
+            ""
+        )
     )
 
     if len(username) < 3:
@@ -783,11 +856,17 @@ def login():
     ) or {}
 
     username = str(
-        data.get("username", "")
+        data.get(
+            "username",
+            ""
+        )
     ).strip()
 
     password = str(
-        data.get("password", "")
+        data.get(
+            "password",
+            ""
+        )
     )
 
     connection = db()
@@ -1140,6 +1219,11 @@ def update_profile(user):
 
     connection.close()
 
+    socketio.emit(
+        "profile_updated",
+        public_user(updated)
+    )
+
     return jsonify({
         "success": True,
         "user": public_user(updated)
@@ -1267,13 +1351,7 @@ def send_message(user):
             edited_at,
             created_at
         )
-        VALUES (
-            ?,
-            ?,
-            0,
-            '',
-            ?
-        )
+        VALUES (?, ?, 0, '', ?)
     """, (
         user["id"],
         message,
@@ -1284,43 +1362,21 @@ def send_message(user):
 
     connection.commit()
 
-    row = connection.execute("""
-        SELECT
-            messages.id,
-            messages.user_id,
-            users.username,
-            users.role,
-            users.show_role_tag,
-            users.pfp,
-            users.last_seen,
-            messages.message,
-            messages.edited,
-            messages.edited_at,
-            messages.created_at
-        FROM messages
-        JOIN users
-            ON users.id=messages.user_id
-        WHERE messages.id=?
-    """, (
+    result = message_object(
+        connection,
         message_id,
-    )).fetchone()
+        user["id"]
+    )
 
     connection.close()
 
-    result = dict(row)
-
-    result["online"] = is_online(
-        row["last_seen"]
+    socketio.emit(
+        "new_public_message",
+        result
     )
-
-    result["is_owner"] = True
 
     return jsonify(result)
 
-
-# ============================================================
-# EDIT MESSAGE
-# ============================================================
 
 @app.put("/api/messages/<int:message_id>")
 @require_user
@@ -1390,16 +1446,25 @@ def edit_message(
     ))
 
     connection.commit()
-    connection.close()
 
-    return jsonify(
-        success=True
+    result = message_object(
+        connection,
+        message_id,
+        user["id"]
     )
 
+    connection.close()
 
-# ============================================================
-# DELETE MESSAGE
-# ============================================================
+    socketio.emit(
+        "message_edited",
+        result
+    )
+
+    return jsonify(
+        success=True,
+        message=result
+    )
+
 
 @app.delete("/api/messages/<int:message_id>")
 @require_user
@@ -1426,8 +1491,6 @@ def delete_message(
             error="Message not found"
         ), 404
 
-    # Normal users can only delete
-    # their own messages.
     if message["user_id"] != user["id"]:
 
         connection.close()
@@ -1445,6 +1508,13 @@ def delete_message(
 
     connection.commit()
     connection.close()
+
+    socketio.emit(
+        "message_deleted",
+        {
+            "id": message_id
+        }
+    )
 
     return jsonify(
         success=True
@@ -1502,7 +1572,7 @@ def search_friends(user):
 
 @app.post("/api/friends/add")
 @require_user
-def add_friend_by_username(user):
+def add_friend(user):
 
     data = request.get_json(
         silent=True
@@ -1516,7 +1586,6 @@ def add_friend_by_username(user):
     ).strip()
 
     if not username:
-
         return jsonify(
             error="Enter a username"
         ), 400
@@ -1581,8 +1650,6 @@ def add_friend_by_username(user):
                 error="You are already friends"
             ), 409
 
-        # If the other person sent us
-        # a request, accept it.
         if (
             existing["user_id"]
             == target["id"]
@@ -1605,6 +1672,24 @@ def add_friend_by_username(user):
             connection.commit()
             connection.close()
 
+            socketio.emit(
+                "friend_updated",
+                {
+                    "user_id": user["id"],
+                    "friend_id": target["id"]
+                },
+                room=f"user_{target['id']}"
+            )
+
+            socketio.emit(
+                "friend_updated",
+                {
+                    "user_id": user["id"],
+                    "friend_id": target["id"]
+                },
+                room=f"user_{user['id']}"
+            )
+
             return jsonify(
                 success=True,
                 status="accepted"
@@ -1622,11 +1707,7 @@ def add_friend_by_username(user):
             friend_id,
             status
         )
-        VALUES (
-            ?,
-            ?,
-            'pending'
-        )
+        VALUES (?, ?, 'pending')
     """, (
         user["id"],
         target["id"]
@@ -1634,6 +1715,14 @@ def add_friend_by_username(user):
 
     connection.commit()
     connection.close()
+
+    socketio.emit(
+        "friend_request",
+        {
+            "from": public_user(user)
+        },
+        room=f"user_{target['id']}"
+    )
 
     return jsonify(
         success=True,
@@ -1763,6 +1852,24 @@ def accept_friend(
     connection.commit()
     connection.close()
 
+    socketio.emit(
+        "friend_updated",
+        {
+            "user_id": user["id"],
+            "friend_id": request_row["user_id"]
+        },
+        room=f"user_{user['id']}"
+    )
+
+    socketio.emit(
+        "friend_updated",
+        {
+            "user_id": user["id"],
+            "friend_id": request_row["user_id"]
+        },
+        room=f"user_{request_row['user_id']}"
+    )
+
     return jsonify(
         success=True
     )
@@ -1792,6 +1899,24 @@ def remove_friend(
 
     connection.commit()
     connection.close()
+
+    socketio.emit(
+        "friend_updated",
+        {
+            "user_id": user["id"],
+            "friend_id": user_id
+        },
+        room=f"user_{user_id}"
+    )
+
+    socketio.emit(
+        "friend_updated",
+        {
+            "user_id": user["id"],
+            "friend_id": user_id
+        },
+        room=f"user_{user['id']}"
+    )
 
     return jsonify(
         success=True
@@ -1912,7 +2037,7 @@ def send_dm(
         ), 403
 
     target = connection.execute("""
-        SELECT id
+        SELECT *
         FROM users
         WHERE id=? AND banned=0
     """, (
@@ -1927,7 +2052,7 @@ def send_dm(
             error="User not found"
         ), 404
 
-    connection.execute("""
+    cursor = connection.execute("""
         INSERT INTO private_messages (
             sender_id,
             receiver_id,
@@ -1936,14 +2061,7 @@ def send_dm(
             edited_at,
             created_at
         )
-        VALUES (
-            ?,
-            ?,
-            ?,
-            0,
-            '',
-            ?
-        )
+        VALUES (?, ?, ?, 0, '', ?)
     """, (
         user["id"],
         user_id,
@@ -1951,12 +2069,55 @@ def send_dm(
         now()
     ))
 
+    message_id = cursor.lastrowid
+
     connection.commit()
+
+    row = connection.execute("""
+        SELECT
+            pm.id,
+            pm.sender_id,
+            pm.receiver_id,
+            pm.message,
+            pm.edited,
+            pm.edited_at,
+            pm.created_at,
+            u.username,
+            u.pfp,
+            u.role,
+            u.last_seen
+        FROM private_messages pm
+        JOIN users u
+            ON u.id=pm.sender_id
+        WHERE pm.id=?
+    """, (
+        message_id,
+    )).fetchone()
+
     connection.close()
 
-    return jsonify(
-        success=True
+    result = dict(row)
+
+    result["online"] = is_online(
+        row["last_seen"]
     )
+
+    socketio.emit(
+        "new_dm_message",
+        result,
+        room=f"user_{user['id']}"
+    )
+
+    socketio.emit(
+        "new_dm_message",
+        result,
+        room=f"user_{user_id}"
+    )
+
+    return jsonify({
+        "success": True,
+        "message": result
+    })
 
 
 # ============================================================
@@ -2065,42 +2226,6 @@ def create_report(user):
             error="You cannot report yourself"
         ), 400
 
-    duplicate = connection.execute("""
-        SELECT id
-        FROM reports
-        WHERE
-            reporter_id=?
-            AND status='open'
-            AND (
-                (
-                    message_id IS NOT NULL
-                    AND message_id=?
-                )
-                OR
-                (
-                    message_id IS NULL
-                    AND reported_user_id=?
-                )
-            )
-        LIMIT 1
-    """, (
-        user["id"],
-        message_id
-        if message_id
-        else -1,
-        reported_user_id
-        if reported_user_id
-        else -1
-    )).fetchone()
-
-    if duplicate:
-
-        connection.close()
-
-        return jsonify(
-            error="You already have an open report for this"
-        ), 409
-
     connection.execute("""
         INSERT INTO reports (
             reporter_id,
@@ -2112,16 +2237,7 @@ def create_report(user):
             created_at,
             moderator_note
         )
-        VALUES (
-            ?,
-            ?,
-            ?,
-            ?,
-            ?,
-            'open',
-            ?,
-            ''
-        )
+        VALUES (?, ?, ?, ?, ?, 'open', ?, '')
     """, (
         user["id"],
         reported_user_id,
@@ -2133,6 +2249,13 @@ def create_report(user):
 
     connection.commit()
     connection.close()
+
+    socketio.emit(
+        "new_report",
+        {
+            "created": True
+        }
+    )
 
     return jsonify(
         success=True
@@ -2405,6 +2528,14 @@ def ban_user(
     connection.commit()
     connection.close()
 
+    socketio.emit(
+        "user_banned",
+        {
+            "user_id": user_id
+        },
+        room=f"user_{user_id}"
+    )
+
     return jsonify(
         success=True
     )
@@ -2486,6 +2617,13 @@ def mod_delete_message(
     connection.commit()
     connection.close()
 
+    socketio.emit(
+        "message_deleted",
+        {
+            "id": message_id
+        }
+    )
+
     return jsonify(
         success=True
     )
@@ -2562,7 +2700,7 @@ def change_role(
     if new_role == "owner":
 
         return jsonify(
-            error="Owner role cannot be assigned through this endpoint"
+            error="Owner role cannot be assigned"
         ), 403
 
     connection = db()
@@ -2615,13 +2753,21 @@ def change_role(
     connection.commit()
     connection.close()
 
+    socketio.emit(
+        "role_changed",
+        {
+            "user_id": user_id,
+            "role": new_role
+        }
+    )
+
     return jsonify(
         success=True
     )
 
 
 # ============================================================
-# OWNER API
+# OWNER
 # ============================================================
 
 @app.post("/api/owner/ip-ban/<int:user_id>")
@@ -2695,6 +2841,14 @@ def owner_ip_ban(
 
     connection.commit()
     connection.close()
+
+    socketio.emit(
+        "user_banned",
+        {
+            "user_id": user_id
+        },
+        room=f"user_{user_id}"
+    )
 
     return jsonify(
         success=True
@@ -2829,28 +2983,47 @@ def owner_delete_account(
     connection.commit()
     connection.close()
 
+    socketio.emit(
+        "account_deleted",
+        {
+            "user_id": user_id
+        }
+    )
+
     return jsonify(
         success=True
     )
 
 
 # ============================================================
-# WEB CLIENT
+# HTML
 # ============================================================
 
 HTML = r"""
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
 
 <meta charset="UTF-8">
 
 <meta
     name="viewport"
-    content="width=device-width, initial-scale=1.0"
+    content="
+        width=device-width,
+        initial-scale=1.0,
+        viewport-fit=cover
+    "
+>
+
+<meta
+    name="theme-color"
+    content="#0b0b11"
 >
 
 <title>SpookChat</title>
+
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
 
 <style>
 
@@ -2858,19 +3031,31 @@ HTML = r"""
     box-sizing: border-box;
 }
 
+html,
 body {
     margin: 0;
-    background: #08080d;
-    color: #eeeeF5;
-    font-family: Arial, Helvetica, sans-serif;
-    height: 100vh;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+}
+
+body {
+    background: #09090f;
+    color: #f4f4f7;
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
     overflow: hidden;
 }
 
 button,
 input,
 textarea {
-    font-family: inherit;
+    font: inherit;
 }
 
 button {
@@ -2885,70 +3070,122 @@ button {
    AUTH
    ============================================================ */
 
-#auth {
+#authScreen {
     width: 100%;
-    height: 100vh;
+    height: 100dvh;
+
     display: flex;
-    justify-content: center;
     align-items: center;
+    justify-content: center;
+
+    padding: 20px;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #241139 0,
+            #0b0b11 45%
+        );
 }
 
 .auth-box {
-    width: 380px;
-    background: #111118;
+    width: 100%;
+    max-width: 420px;
+
+    padding: 32px;
+
     border: 1px solid #292936;
-    border-radius: 15px;
-    padding: 30px;
-    box-shadow: 0 20px 60px rgba(0,0,0,.45);
+
+    border-radius: 18px;
+
+    background: rgba(
+        18,
+        18,
+        27,
+        .95
+    );
+
+    box-shadow:
+        0 20px 80px
+        rgba(0,0,0,.5);
 }
 
 .brand {
-    font-size: 26px;
-    font-weight: bold;
+    font-size: 24px;
+    font-weight: 900;
+    letter-spacing: -.5px;
 }
 
 .brand span {
-    color: #8c52ff;
+    color: #9d5cff;
 }
 
-.auth-box h1 {
-    margin-top: 0;
+.auth-box h2 {
+    margin-top: 30px;
 }
 
 .auth-box input {
     width: 100%;
-    margin-top: 10px;
-    padding: 13px;
-    background: #0b0b10;
-    color: white;
-    border: 1px solid #292936;
-    border-radius: 8px;
+
+    margin-top: 12px;
+
+    padding: 13px 14px;
+
+    border:
+        1px solid #30303d;
+
+    border-radius: 10px;
+
     outline: none;
+
+    background: #111119;
+
+    color: white;
+}
+
+.auth-box input:focus {
+    border-color: #9d5cff;
 }
 
 .primary {
     width: 100%;
-    margin-top: 15px;
+
+    margin-top: 16px;
+
     padding: 13px;
-    background: #7d45e8;
-    border: none;
-    border-radius: 8px;
+
+    border: 0;
+
+    border-radius: 10px;
+
+    background: #8d4fff;
+
     color: white;
-    font-weight: bold;
+
+    font-weight: 800;
+}
+
+.primary:hover {
+    background: #9d62ff;
 }
 
 .switch {
-    margin-top: 15px;
-    color: #a979ff;
-    cursor: pointer;
+    margin-top: 18px;
+
     text-align: center;
+
+    color: #9d5cff;
+
+    cursor: pointer;
 }
 
 .error {
-    color: #ff6b6b;
-    margin-bottom: 8px;
-}
+    color: #ff5f70;
 
+    margin-top: 10px;
+
+    min-height: 20px;
+}
 
 /* ============================================================
    APP
@@ -2956,432 +3193,830 @@ button {
 
 #app {
     display: flex;
-    height: 100vh;
+
+    width: 100%;
+    height: 100dvh;
 }
 
+/* ============================================================
+   SIDEBAR
+   ============================================================ */
+
 .sidebar {
-    width: 240px;
+    width: 250px;
+
     flex-shrink: 0;
-    border-right: 1px solid #292936;
-    background: #101016;
-    padding: 20px;
+
+    display: flex;
+    flex-direction: column;
+
+    background: #0d0d14;
+
+    border-right:
+        1px solid #24242e;
 }
 
 .sidebar .brand {
-    margin-bottom: 25px;
+    padding: 20px;
+}
+
+.nav {
+    padding: 8px;
 }
 
 .nav button {
-    display: block;
     width: 100%;
+
+    padding: 11px 13px;
+
+    margin-bottom: 5px;
+
+    border: 0;
+
+    border-radius: 8px;
+
     text-align: left;
+
+    color: #c9c9d3;
+
     background: transparent;
-    color: #a5a5b1;
-    border: none;
-    padding: 12px;
-    border-radius: 7px;
-    margin-bottom: 4px;
 }
 
 .nav button:hover {
-    background: #191922;
+    background: #191923;
     color: white;
 }
 
 .friends-title {
-    margin-top: 35px;
-    font-size: 11px;
+    padding:
+        18px
+        14px
+        8px;
+
     color: #777783;
+
+    font-size: 11px;
+
     text-transform: uppercase;
+
+    font-weight: 800;
 }
 
 #friendList {
-    margin-top: 10px;
+    overflow-y: auto;
+
+    padding: 0 8px;
 }
 
 .dm-friend {
-    padding: 9px;
-    color: #aaa;
-    cursor: pointer;
+    padding: 9px 10px;
+
     border-radius: 7px;
-}
 
-.dm-friend:hover {
-    background: #191922;
-    color: white;
-}
+    color: #aaaab5;
 
-.main {
-    flex: 1;
-    min-width: 0;
+    cursor: pointer;
+
     display: flex;
-    flex-direction: column;
-}
 
-.topbar {
-    height: 60px;
-    border-bottom: 1px solid #292936;
-    display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 0 22px;
-}
 
-.channel {
-    font-weight: bold;
-}
-
-.channel span {
-    color: #8c52ff;
-}
-
-#currentUser {
-    color: #aaa;
-}
-
-.messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px;
-}
-
-.composer {
-    border-top: 1px solid #292936;
-    padding: 14px;
-}
-
-.composer-inner {
-    display: flex;
     gap: 8px;
 }
 
-.composer input {
-    flex: 1;
-    background: #111118;
-    color: white;
-    border: 1px solid #292936;
-    border-radius: 9px;
-    padding: 13px;
-    outline: none;
-}
+.dm-friend:hover {
+    background: #181821;
 
-.composer button {
-    width: 50px;
-    border: none;
-    border-radius: 9px;
-    background: #7d45e8;
     color: white;
 }
-
-.right {
-    width: 280px;
-    border-left: 1px solid #292936;
-    background: #101016;
-    padding: 20px;
-}
-
 
 /* ============================================================
-   MESSAGES
+   MAIN
    ============================================================ */
+
+.main {
+    min-width: 0;
+
+    flex: 1;
+
+    position: relative;
+
+    background: #0b0b12;
+}
+
+.topbar {
+    height: 58px;
+
+    display: flex;
+
+    align-items: center;
+
+    padding:
+        0 18px;
+
+    border-bottom:
+        1px solid #24242e;
+
+    background: #101018;
+
+    position: relative;
+
+    z-index: 5;
+}
+
+.channel {
+    font-weight: 800;
+}
+
+.channel span {
+    color: #777783;
+}
+
+#currentUser {
+    margin-left: auto;
+
+    color: #9999a6;
+
+    font-size: 13px;
+}
+
+.messages {
+    position: absolute;
+
+    left: 0;
+    right: 0;
+    top: 58px;
+    bottom: 72px;
+
+    overflow-y: auto;
+
+    padding: 15px;
+
+    scroll-behavior: smooth;
+
+    -webkit-overflow-scrolling: touch;
+}
 
 .message {
     display: flex;
-    gap: 12px;
-    padding: 10px;
+
+    gap: 10px;
+
+    padding: 8px;
+
     border-radius: 8px;
-    position: relative;
 }
 
 .message:hover {
-    background: #101017;
+    background: #11111a;
+}
+
+.message-content {
+    min-width: 0;
+
+    flex: 1;
+}
+
+.message-header {
+    display: flex;
+
+    align-items: baseline;
+
+    gap: 8px;
+
+    flex-wrap: wrap;
+}
+
+.username {
+    font-weight: 800;
+}
+
+.timestamp {
+    color: #656572;
+
+    font-size: 11px;
+}
+
+.message-text {
+    margin-top: 2px;
+
+    color: #dedee5;
+
+    white-space: pre-wrap;
+
+    overflow-wrap: anywhere;
+
+    word-break: break-word;
+
+    line-height: 1.45;
+}
+
+.edited {
+    margin-left: 5px;
+
+    color: #666673;
+
+    font-size: 10px;
 }
 
 .avatar {
     width: 40px;
     height: 40px;
-    flex-shrink: 0;
-    border-radius: 50%;
-    background: #24242e;
+
+    min-width: 40px;
+
     display: flex;
-    justify-content: center;
+
     align-items: center;
+
+    justify-content: center;
+
     overflow: hidden;
+
+    border-radius: 50%;
+
+    background:
+        linear-gradient(
+            135deg,
+            #6d3bc1,
+            #a65cff
+        );
+
+    font-weight: 900;
 }
 
 .avatar img {
     width: 100%;
     height: 100%;
+
     object-fit: cover;
 }
 
-.message-content {
-    min-width: 0;
+/* ============================================================
+   COMPOSER
+   ============================================================ */
+
+.composer {
+    position: absolute;
+
+    left: 0;
+    right: 0;
+    bottom: 0;
+
+    padding:
+        8px
+        15px
+        calc(
+            8px +
+            env(
+                safe-area-inset-bottom
+            )
+        );
+
+    background: #101018;
+
+    z-index: 10;
 }
 
-.message-header {
+.composer-inner {
     display: flex;
-    align-items: center;
+
     gap: 8px;
+
+    padding: 5px 7px 5px 14px;
+
+    background: #1a1a24;
+
+    border-radius: 12px;
+
+    border:
+        1px solid #292936;
 }
 
-.username {
-    font-weight: bold;
-    color: white;
-    cursor: pointer;
-}
+.composer input {
+    min-width: 0;
 
-.timestamp {
-    color: #666673;
-    font-size: 11px;
-}
+    flex: 1;
 
-.message-text {
-    margin-top: 4px;
-    color: #d8d8e0;
-    white-space: pre-wrap;
-    word-break: break-word;
-}
+    border: 0;
 
-.edited {
-    color: #666673;
-    font-size: 11px;
-    margin-left: 6px;
-}
+    outline: 0;
 
-
-/* ============================================================
-   CONTEXT MENU
-   ============================================================ */
-
-.context-menu {
-    position: fixed;
-    z-index: 9999;
-    width: 190px;
-    background: #15151d;
-    border: 1px solid #30303d;
-    border-radius: 9px;
-    padding: 6px;
-    box-shadow: 0 15px 40px rgba(0,0,0,.5);
-}
-
-.context-menu button {
-    width: 100%;
-    border: none;
     background: transparent;
-    color: #ddd;
-    text-align: left;
-    padding: 10px;
-    border-radius: 6px;
+
+    color: white;
+
+    font-size: 15px;
 }
 
-.context-menu button:hover {
-    background: #24242f;
-}
+.composer button {
+    width: 42px;
+    height: 42px;
 
-.context-menu .danger {
-    color: #ff7373;
-}
+    border: 0;
 
+    border-radius: 9px;
+
+    background: #8d4fff;
+
+    color: white;
+
+    font-size: 19px;
+}
 
 /* ============================================================
-   PROFILES
+   RIGHT PANEL
    ============================================================ */
 
-.profile-card {
-    text-align: center;
-}
+.right {
+    width: 250px;
 
-.big-avatar {
-    width: 90px;
-    height: 90px;
-    border-radius: 50%;
-    background: #24242e;
-    margin: 0 auto 12px;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    overflow: hidden;
-    font-size: 35px;
-}
+    flex-shrink: 0;
 
-.big-avatar img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-}
+    border-left:
+        1px solid #24242e;
 
-.profile-name {
-    font-size: 20px;
-    font-weight: bold;
-}
+    background: #0d0d14;
 
-.role-tag {
-    font-size: 10px;
-    background: #7d45e8;
-    border-radius: 4px;
-    padding: 3px 5px;
-    margin-left: 4px;
+    overflow-y: auto;
 }
-
-.status {
-    margin-top: 7px;
-    color: #888;
-}
-
-.status-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #666;
-    margin-right: 5px;
-}
-
-.status-dot.online {
-    background: #45d483;
-}
-
-.profile-description {
-    color: #999;
-    margin: 15px 0;
-    line-height: 1.4;
-}
-
-.action-button {
-    border: none;
-    background: #7d45e8;
-    color: white;
-    padding: 9px 13px;
-    border-radius: 7px;
-}
-
 
 /* ============================================================
    PANELS
    ============================================================ */
 
 .panel {
-    max-width: 900px;
-    margin: 0 auto;
-    width: 100%;
+    width: min(
+        900px,
+        100%
+    );
+
+    margin: auto;
+
+    padding: 25px;
 }
 
 .panel-card {
-    background: #111118;
-    border: 1px solid #292936;
-    border-radius: 10px;
     padding: 15px;
+
     margin-bottom: 10px;
+
+    border:
+        1px solid #292936;
+
+    border-radius: 12px;
+
+    background: #111119;
 }
 
 .panel-row {
     display: flex;
+
+    align-items: center;
+
     justify-content: space-between;
-    gap: 15px;
+
+    gap: 10px;
+}
+
+.action-button,
+.small-button {
+    border: 0;
+
+    border-radius: 8px;
+
+    padding: 9px 13px;
+
+    background: #8d4fff;
+
+    color: white;
+
+    font-weight: 700;
 }
 
 .small-button {
-    border: 1px solid #343440;
-    background: #191922;
-    color: white;
     padding: 7px 10px;
-    border-radius: 6px;
-    margin: 2px;
+
+    background: #272733;
 }
 
 .small-button:hover {
-    background: #252530;
+    background: #343442;
 }
 
-.small-button.danger {
-    color: #ff7777;
+.danger {
+    background: #7e2635 !important;
 }
-
-
-/* ============================================================
-   FRIENDS
-   ============================================================ */
 
 .friend-search {
     display: flex;
+
     gap: 8px;
+
     margin-bottom: 20px;
 }
 
 .friend-search input {
     flex: 1;
+
+    min-width: 0;
+
     padding: 11px;
-    background: #0c0c11;
+
+    border:
+        1px solid #30303d;
+
+    border-radius: 8px;
+
+    background: #111119;
+
     color: white;
-    border: 1px solid #292936;
-    border-radius: 7px;
+
+    outline: none;
 }
 
 .friend-card {
     display: flex;
+
     align-items: center;
+
     justify-content: space-between;
-    background: #111118;
-    border: 1px solid #292936;
+
+    gap: 10px;
+
     padding: 12px;
-    border-radius: 9px;
+
     margin-bottom: 8px;
+
+    border-radius: 10px;
+
+    background: #15151e;
 }
 
 .friend-left {
     display: flex;
+
     align-items: center;
+
     gap: 10px;
+
+    min-width: 0;
 }
 
+.status-dot {
+    width: 9px;
+    height: 9px;
+
+    min-width: 9px;
+
+    border-radius: 50%;
+
+    background: #555562;
+}
+
+.status-dot.online {
+    background: #43dc83;
+
+    box-shadow:
+        0 0 8px
+        rgba(
+            67,
+            220,
+            131,
+            .6
+        );
+}
 
 /* ============================================================
    MODAL
    ============================================================ */
 
-.modal {
+#modal {
     position: fixed;
+
     inset: 0;
-    background: rgba(0,0,0,.7);
+
+    z-index: 500;
+
     display: flex;
-    justify-content: center;
+
     align-items: center;
-    z-index: 10000;
+
+    justify-content: center;
+
+    padding: 15px;
+
+    background:
+        rgba(
+            0,
+            0,
+            0,
+            .72
+        );
 }
 
 .modal-box {
-    width: 500px;
-    max-width: calc(100% - 30px);
-    background: #111118;
-    border: 1px solid #292936;
-    border-radius: 12px;
-    padding: 20px;
+    width: min(
+        550px,
+        100%
+    );
+
+    max-height: 90dvh;
+
+    overflow-y: auto;
+
+    padding: 22px;
+
+    border:
+        1px solid #30303d;
+
+    border-radius: 15px;
+
+    background: #111119;
 }
 
 .modal-box input,
 .modal-box textarea {
     width: 100%;
-    background: #09090d;
+
+    margin-top: 8px;
+    margin-bottom: 12px;
+
+    padding: 11px;
+
+    border:
+        1px solid #30303d;
+
+    border-radius: 8px;
+
+    background: #0c0c12;
+
     color: white;
-    border: 1px solid #292936;
-    border-radius: 7px;
-    padding: 10px;
-    margin-bottom: 10px;
+
+    outline: none;
 }
 
 .modal-box textarea {
     min-height: 120px;
+
+    resize: vertical;
 }
 
 .modal-actions {
     display: flex;
+
     justify-content: flex-end;
+
     gap: 8px;
-    margin-top: 12px;
+
+    margin-top: 15px;
+}
+
+/* ============================================================
+   MOBILE NAV
+   ============================================================ */
+
+.mobile-nav {
+    display: none;
+}
+
+
+/* ============================================================
+   MOBILE
+   ============================================================ */
+
+@media (max-width: 768px) {
+
+    body {
+        height: 100dvh;
+    }
+
+    #app {
+        height: 100dvh;
+    }
+
+    .sidebar {
+        display: none;
+
+        position: fixed;
+
+        left: 0;
+        top: 0;
+
+        width: 100%;
+
+        height:
+            calc(
+                100dvh - 65px
+            );
+
+        z-index: 100;
+
+        box-shadow:
+            0 20px 60px
+            rgba(0,0,0,.6);
+    }
+
+    .sidebar.mobile-open {
+        display: flex;
+    }
+
+    .sidebar .brand {
+        padding: 18px;
+    }
+
+    .nav {
+        display: block;
+
+        padding: 10px;
+    }
+
+    .nav button {
+        padding: 14px;
+
+        font-size: 15px;
+    }
+
+    .friends-title {
+        padding-left: 18px;
+    }
+
+    #friendList {
+        padding: 0 12px;
+
+        overflow-y: auto;
+    }
+
+    .main {
+        position: fixed;
+
+        inset: 0;
+
+        bottom: 65px;
+
+        height:
+            calc(
+                100dvh - 65px
+            );
+
+        width: 100%;
+    }
+
+    .topbar {
+        height: 56px;
+
+        padding:
+            0 12px;
+    }
+
+    .messages {
+        top: 56px;
+
+        bottom: 68px;
+
+        padding:
+            8px 5px;
+    }
+
+    .message {
+        padding:
+            7px 5px;
+    }
+
+    .avatar {
+        width: 36px;
+        height: 36px;
+
+        min-width: 36px;
+    }
+
+    .message-text {
+        font-size: 14px;
+    }
+
+    .composer {
+        bottom: 0;
+
+        padding:
+            7px
+            7px
+            calc(
+                7px +
+                env(
+                    safe-area-inset-bottom
+                )
+            );
+    }
+
+    .composer-inner {
+        padding-left: 11px;
+    }
+
+    .composer input {
+        font-size: 16px;
+    }
+
+    .right {
+        display: none !important;
+    }
+
+    .mobile-nav {
+        position: fixed;
+
+        display: flex;
+
+        left: 0;
+        right: 0;
+        bottom: 0;
+
+        height: 65px;
+
+        z-index: 200;
+
+        padding-bottom:
+            env(
+                safe-area-inset-bottom
+            );
+
+        background: #0d0d14;
+
+        border-top:
+            1px solid #292936;
+    }
+
+    .mobile-nav button {
+        flex: 1;
+
+        border: 0;
+
+        background: transparent;
+
+        color: #777783;
+
+        font-size: 21px;
+
+        display: flex;
+
+        align-items: center;
+
+        justify-content: center;
+
+        flex-direction: column;
+
+        gap: 1px;
+    }
+
+    .mobile-nav button span {
+        font-size: 10px;
+    }
+
+    .mobile-nav button.active {
+        color: #a65cff;
+    }
+
+    .panel {
+        padding: 15px 10px;
+    }
+
+    .panel h2 {
+        margin-top: 5px;
+    }
+
+    .friend-search {
+        flex-direction: row;
+    }
+
+    .friend-search button {
+        white-space: nowrap;
+    }
+
+    .friend-card {
+        padding: 10px;
+    }
+
+    .panel-row {
+        align-items: flex-start;
+
+        flex-direction: column;
+    }
+
+    .panel-row > div:last-child {
+        width: 100%;
+    }
+
+    .modal-box {
+        width: calc(
+            100% - 20px
+        );
+
+        max-height: 90dvh;
+
+        border-radius: 14px;
+    }
 }
 
 </style>
+
 </head>
 
 <body>
@@ -3390,7 +4025,7 @@ button {
      AUTH
      ========================================================== -->
 
-<div id="auth">
+<div id="authScreen">
 
     <div class="auth-box">
 
@@ -3410,12 +4045,18 @@ button {
         <input
             id="authUsername"
             placeholder="Username"
+            autocomplete="username"
         >
 
         <input
             id="authPassword"
             placeholder="Password"
             type="password"
+            autocomplete="current-password"
+            onkeydown="
+                if(event.key === 'Enter')
+                    authAction()
+            "
         >
 
         <button
@@ -3457,21 +4098,15 @@ button {
 
         <div class="nav">
 
-            <button
-                onclick="showHome()"
-            >
+            <button onclick="showHome()">
                 💬 Chat
             </button>
 
-            <button
-                onclick="showFriends()"
-            >
+            <button onclick="showFriends()">
                 👥 Friends
             </button>
 
-            <button
-                onclick="showProfile()"
-            >
+            <button onclick="showProfile()">
                 👤 Profile
             </button>
 
@@ -3491,9 +4126,7 @@ button {
                 ⚙️ Owner
             </button>
 
-            <button
-                onclick="logout()"
-            >
+            <button onclick="logout()">
                 🚪 Logout
             </button>
 
@@ -3539,9 +4172,12 @@ button {
                 <input
                     id="messageInput"
                     placeholder="Message #general"
+                    autocomplete="off"
                     onkeydown="
-                        if(event.key==='Enter')
-                        sendMessage()
+                        if(event.key === 'Enter' && !event.shiftKey) {
+                            event.preventDefault();
+                            sendMessage();
+                        }
                     "
                 >
 
@@ -3563,6 +4199,42 @@ button {
         id="rightPanel"
     ></aside>
 
+
+    <nav class="mobile-nav">
+
+        <button
+            onclick="showHome()"
+            id="mobileChatButton"
+        >
+            💬
+            <span>Chat</span>
+        </button>
+
+        <button
+            onclick="showFriends()"
+            id="mobileFriendsButton"
+        >
+            👥
+            <span>Friends</span>
+        </button>
+
+        <button
+            onclick="showProfile()"
+            id="mobileProfileButton"
+        >
+            👤
+            <span>Profile</span>
+        </button>
+
+        <button
+            onclick="toggleMobileSidebar()"
+        >
+            ☰
+            <span>More</span>
+        </button>
+
+    </nav>
+
 </div>
 
 
@@ -3572,7 +4244,7 @@ button {
 
 <div
     id="modal"
-    class="modal hidden"
+    class="hidden"
 >
 
     <div
@@ -3583,11 +4255,11 @@ button {
 </div>
 
 
-<!-- ==========================================================
-     JAVASCRIPT
-     ========================================================== -->
-
 <script>
+
+/* ============================================================
+   STATE
+   ============================================================ */
 
 let token =
     localStorage.getItem(
@@ -3596,52 +4268,40 @@ let token =
 
 let currentUser = null;
 
+let currentPage =
+    "chat";
+
 let currentDM = null;
 
-let currentPage = "chat";
+let authMode =
+    "login";
 
-let registerMode = false;
-
-let contextMessage = null;
+let socket = null;
 
 
 /* ============================================================
-   HELPERS
+   API
    ============================================================ */
-
-function escapeHtml(value) {
-
-    return String(
-        value ?? ""
-    )
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-
-function escapeAttr(value) {
-    return escapeHtml(value);
-}
-
 
 async function api(
     url,
     options = {}
 ) {
 
-    options.headers = {
-        ...(options.headers || {}),
-        "Content-Type":
-            "application/json"
-    };
+    options.headers =
+        options.headers || {};
+
+    options.headers[
+        "Content-Type"
+    ] =
+        "application/json";
 
     if (token) {
+
         options.headers[
             "Authorization"
-        ] = token;
+        ] =
+            token;
     }
 
     const response =
@@ -3650,30 +4310,18 @@ async function api(
             options
         );
 
-    const data =
-        await response
-            .json()
-            .catch(() => ({}));
+    let data = {};
+
+    try {
+        data =
+            await response.json();
+    } catch {}
 
     if (!response.ok) {
 
-        if (
-            response.status === 401
-            &&
-            token
-        ) {
-
-            localStorage.removeItem(
-                "spookchat_token"
-            );
-
-            token = null;
-
-            location.reload();
-        }
-
         throw new Error(
-            data.error ||
+            data.error
+            ||
             "Request failed"
         );
     }
@@ -3683,34 +4331,78 @@ async function api(
 
 
 /* ============================================================
+   ESCAPING
+   ============================================================ */
+
+function escapeHtml(value) {
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+    div.textContent =
+        value ?? "";
+
+    return div.innerHTML;
+}
+
+
+function escapeAttr(value) {
+
+    return String(
+        value ?? ""
+    )
+    .replace(
+        /&/g,
+        "&amp;"
+    )
+    .replace(
+        /"/g,
+        "&quot;"
+    )
+    .replace(
+        /</g,
+        "&lt;"
+    )
+    .replace(
+        />/g,
+        "&gt;"
+    );
+}
+
+
+/* ============================================================
    AUTH
    ============================================================ */
 
 function toggleAuth() {
 
-    registerMode =
-        !registerMode;
+    authMode =
+        authMode === "login"
+        ? "register"
+        : "login";
 
     document.getElementById(
         "authTitle"
     ).textContent =
-        registerMode
-        ? "Register"
-        : "Login";
+        authMode === "login"
+        ? "Login"
+        : "Register";
 
     document.getElementById(
         "authButton"
     ).textContent =
-        registerMode
-        ? "Register"
-        : "Login";
+        authMode === "login"
+        ? "Login"
+        : "Create Account";
 
     document.getElementById(
         "authSwitch"
     ).textContent =
-        registerMode
-        ? "Already have an account? Login"
-        : "Need an account? Register";
+        authMode === "login"
+        ? "Need an account? Register"
+        : "Already have an account? Login";
 
     document.getElementById(
         "authError"
@@ -3736,36 +4428,39 @@ async function authAction() {
             "authError"
         );
 
-    error.textContent = "";
+    error.textContent =
+        "";
 
     try {
 
-        const result =
+        const data =
             await api(
-                registerMode
-                ? "/api/register"
-                : "/api/login",
+                authMode === "login"
+                ? "/api/login"
+                : "/api/register",
                 {
                     method: "POST",
-                    body: JSON.stringify({
-                        username,
-                        password
-                    })
+
+                    body:
+                        JSON.stringify({
+                            username,
+                            password
+                        })
                 }
             );
 
         token =
-            result.token;
+            data.token;
+
+        currentUser =
+            data.user;
 
         localStorage.setItem(
             "spookchat_token",
             token
         );
 
-        currentUser =
-            result.user;
-
-        startApp();
+        await startApp();
 
     } catch (err) {
 
@@ -3776,7 +4471,7 @@ async function authAction() {
 
 
 /* ============================================================
-   APP START
+   START APP
    ============================================================ */
 
 async function startApp() {
@@ -3790,29 +4485,17 @@ async function startApp() {
 
     } catch {
 
-        localStorage.removeItem(
-            "spookchat_token"
-        );
-
         token = null;
 
-        document.getElementById(
-            "auth"
-        ).classList.remove(
-            "hidden"
-        );
-
-        document.getElementById(
-            "app"
-        ).classList.add(
-            "hidden"
+        localStorage.removeItem(
+            "spookchat_token"
         );
 
         return;
     }
 
     document.getElementById(
-        "auth"
+        "authScreen"
     ).classList.add(
         "hidden"
     );
@@ -3830,9 +4513,11 @@ async function startApp() {
 
     updateRoleButtons();
 
-    await showHome();
+    connectRealtime();
 
     await loadFriendList();
+
+    await showHome();
 }
 
 
@@ -3855,10 +4540,13 @@ function updateRoleButtons() {
         ||
         currentUser.role === "owner"
     ) {
+
         moderation.classList.remove(
             "hidden"
         );
+
     } else {
+
         moderation.classList.add(
             "hidden"
         );
@@ -3867,10 +4555,13 @@ function updateRoleButtons() {
     if (
         currentUser.role === "owner"
     ) {
+
         owner.classList.remove(
             "hidden"
         );
+
     } else {
+
         owner.classList.add(
             "hidden"
         );
@@ -3879,39 +4570,390 @@ function updateRoleButtons() {
 
 
 /* ============================================================
-   LOGOUT
+   REALTIME
    ============================================================ */
 
-async function logout() {
+function connectRealtime() {
 
-    try {
-        await api(
-            "/api/logout",
-            {
-                method: "POST"
+    if (!token) {
+        return;
+    }
+
+    if (socket) {
+        socket.disconnect();
+    }
+
+    socket =
+        io({
+            transports: [
+                "websocket",
+                "polling"
+            ]
+        });
+
+    socket.on(
+        "connect",
+        () => {
+
+            console.log(
+                "SpookChat realtime connected"
+            );
+
+            socket.emit(
+                "join_user",
+                {
+                    user_id:
+                        currentUser.id
+                }
+            );
+
+            if (currentDM) {
+
+                socket.emit(
+                    "join_dm",
+                    {
+                        user_id:
+                            currentDM
+                    }
+                );
             }
-        );
-    } catch {}
-
-    localStorage.removeItem(
-        "spookchat_token"
+        }
     );
 
-    token = null;
+    socket.on(
+        "disconnect",
+        () => {
 
-    location.reload();
+            console.log(
+                "Realtime disconnected"
+            );
+        }
+    );
+
+    socket.on(
+        "new_public_message",
+        message => {
+
+            if (
+                currentPage === "chat"
+                &&
+                currentDM === null
+            ) {
+
+                appendMessage(
+                    message
+                );
+            }
+        }
+    );
+
+    socket.on(
+        "new_dm_message",
+        message => {
+
+            const belongs =
+                currentDM !== null
+                &&
+                (
+                    (
+                        message.sender_id
+                        ===
+                        currentDM
+                    )
+                    ||
+                    (
+                        message.receiver_id
+                        ===
+                        currentDM
+                    )
+                );
+
+            if (
+                currentPage === "chat"
+                &&
+                belongs
+            ) {
+
+                appendMessage(
+                    message
+                );
+
+            } else {
+
+                showNotification(
+                    "New message",
+                    message.username
+                    +
+                    ": "
+                    +
+                    message.message
+                );
+            }
+        }
+    );
+
+    socket.on(
+        "message_deleted",
+        data => {
+
+            const element =
+                document.querySelector(
+                    `[data-message-id="${data.id}"]`
+                );
+
+            if (element) {
+                element.remove();
+            }
+        }
+    );
+
+    socket.on(
+        "message_edited",
+        message => {
+
+            const element =
+                document.querySelector(
+                    `[data-message-id="${message.id}"]`
+                );
+
+            if (!element) {
+                return;
+            }
+
+            const text =
+                element.querySelector(
+                    ".message-text"
+                );
+
+            if (!text) {
+                return;
+            }
+
+            text.innerHTML =
+                escapeHtml(
+                    message.message
+                )
+                +
+                `
+                <span class="edited">
+                    (edited)
+                </span>
+                `;
+        }
+    );
+
+    socket.on(
+        "friend_request",
+        () => {
+
+            showNotification(
+                "SpookChat",
+                "You received a friend request."
+            );
+
+            loadFriendList();
+        }
+    );
+
+    socket.on(
+        "friend_updated",
+        () => {
+
+            loadFriendList();
+
+            if (
+                currentPage === "friends"
+            ) {
+                loadFriends();
+            }
+        }
+    );
+
+    socket.on(
+        "profile_updated",
+        user => {
+
+            if (
+                currentUser
+                &&
+                user.id === currentUser.id
+            ) {
+
+                currentUser =
+                    user;
+
+                document.getElementById(
+                    "currentUser"
+                ).textContent =
+                    user.username;
+
+                updateRoleButtons();
+            }
+
+            loadFriendList();
+        }
+    );
+
+    socket.on(
+        "role_changed",
+        data => {
+
+            if (
+                currentUser
+                &&
+                data.user_id
+                ===
+                currentUser.id
+            ) {
+
+                currentUser.role =
+                    data.role;
+
+                updateRoleButtons();
+            }
+        }
+    );
+
+    socket.on(
+        "user_banned",
+        data => {
+
+            if (
+                currentUser
+                &&
+                data.user_id
+                ===
+                currentUser.id
+            ) {
+
+                alert(
+                    "Your account has been banned."
+                );
+
+                logout();
+            }
+        }
+    );
+
+    socket.on(
+        "account_deleted",
+        data => {
+
+            if (
+                currentUser
+                &&
+                data.user_id
+                ===
+                currentUser.id
+            ) {
+
+                logout();
+            }
+        }
+    );
+
+    socket.on(
+        "new_report",
+        () => {
+
+            if (
+                currentUser
+                &&
+                (
+                    currentUser.role
+                    === "moderator"
+                    ||
+                    currentUser.role
+                    === "admin"
+                    ||
+                    currentUser.role
+                    === "owner"
+                )
+            ) {
+
+                if (
+                    currentPage
+                    ===
+                    "moderation"
+                ) {
+
+                    loadReports(
+                        "open"
+                    );
+                }
+            }
+        }
+    );
 }
 
 
 /* ============================================================
-   CHAT
+   NOTIFICATIONS
+   ============================================================ */
+
+function showNotification(
+    title,
+    body
+) {
+
+    if (
+        "Notification"
+        in window
+    ) {
+
+        if (
+            Notification.permission
+            ===
+            "granted"
+        ) {
+
+            new Notification(
+                title,
+                {
+                    body
+                }
+            );
+
+        } else if (
+            Notification.permission
+            !==
+            "denied"
+        ) {
+
+            Notification.requestPermission();
+        }
+    }
+}
+
+
+/* ============================================================
+   HOME
    ============================================================ */
 
 async function showHome() {
 
-    currentPage = "chat";
+    closeMobileSidebar();
 
-    currentDM = null;
+    currentPage =
+        "chat";
+
+    if (
+        socket
+        &&
+        currentDM
+    ) {
+
+        socket.emit(
+            "leave_dm",
+            {
+                user_id:
+                    currentDM
+            }
+        );
+    }
+
+    currentDM =
+        null;
 
     document.getElementById(
         "channelName"
@@ -3919,19 +4961,21 @@ async function showHome() {
         "<span>#</span> general";
 
     document.getElementById(
+        "messageInput"
+    ).placeholder =
+        "Message #general";
+
+    document.getElementById(
         "composer"
     ).classList.remove(
         "hidden"
     );
 
-    document.getElementById(
-        "messageInput"
-    ).placeholder =
-        "Message #general";
+    setMobileActive(
+        "mobileChatButton"
+    );
 
     await loadMessages();
-
-    renderSelfProfile();
 }
 
 
@@ -3947,16 +4991,17 @@ async function loadMessages() {
             "mainContent"
         );
 
-    container.innerHTML = "";
+    container.innerHTML =
+        "";
 
     for (
         const message
         of messages
     ) {
 
-        renderMessage(
+        appendMessage(
             message,
-            container
+            false
         );
     }
 
@@ -3966,13 +5011,30 @@ async function loadMessages() {
 
 
 /* ============================================================
-   MESSAGE RENDERING
+   MESSAGE RENDER
    ============================================================ */
 
-function renderMessage(
+function appendMessage(
     message,
-    container
+    scroll = true
 ) {
+
+    const container =
+        document.getElementById(
+            "mainContent"
+        );
+
+    if (!container) {
+        return;
+    }
+
+    if (
+        container.querySelector(
+            `[data-message-id="${message.id}"]`
+        )
+    ) {
+        return;
+    }
 
     const wrapper =
         document.createElement(
@@ -3985,49 +5047,61 @@ function renderMessage(
     wrapper.dataset.messageId =
         message.id;
 
+    const avatar =
+        message.pfp
+        ?
+        `
+        <img
+            src="${escapeAttr(
+                message.pfp
+            )}"
+        >
+        `
+        :
+        escapeHtml(
+            (
+                message.username
+                ||
+                "?"
+            )
+            .charAt(0)
+            .toUpperCase()
+        );
+
     wrapper.innerHTML = `
 
         <div class="avatar">
-
-            ${
-                message.pfp
-                ?
-                `<img src="${escapeAttr(message.pfp)}">`
-                :
-                escapeHtml(
-                    message.username
-                        .charAt(0)
-                        .toUpperCase()
-                )
-            }
-
+            ${avatar}
         </div>
 
         <div class="message-content">
 
             <div class="message-header">
 
-                <span
-                    class="username"
-                    onclick="
-                        viewProfile(
-                            ${message.user_id}
-                        )
-                    "
-                >
+                <span class="username">
                     ${escapeHtml(
                         message.username
                     )}
                 </span>
 
                 ${
-                    message.role !== "user"
+                    message.role
+                    &&
+                    message.show_role_tag
                     ?
-                    `<span class="role-tag">
+                    `
+                    <span
+                        style="
+                            color:#a65cff;
+                            font-size:10px;
+                            font-weight:800;
+                        "
+                    >
                         ${escapeHtml(
-                            message.role.toUpperCase()
-                        )}
-                    </span>`
+                            message.role
+                        ).toUpperCase()}
+                    </span>
+                    `
                     :
                     ""
                 }
@@ -4035,12 +5109,21 @@ function renderMessage(
                 <span class="timestamp">
                     ${new Date(
                         message.created_at
-                    ).toLocaleTimeString()}
+                    ).toLocaleTimeString(
+                        [],
+                        {
+                            hour:
+                                "numeric",
+                            minute:
+                                "2-digit"
+                        }
+                    )}
                 </span>
 
             </div>
 
             <div class="message-text">
+
                 ${escapeHtml(
                     message.message
                 )}
@@ -4048,9 +5131,11 @@ function renderMessage(
                 ${
                     message.edited
                     ?
-                    `<span class="edited">
+                    `
+                    <span class="edited">
                         (edited)
-                    </span>`
+                    </span>
+                    `
                     :
                     ""
                 }
@@ -4059,726 +5144,46 @@ function renderMessage(
 
         </div>
     `;
-
-
-    /*
-     * THIS IS THE RIGHT-CLICK FEATURE.
-     */
-    wrapper.addEventListener(
-        "contextmenu",
-        function(event) {
-
-            event.preventDefault();
-
-            openMessageMenu(
-                event,
-                message
-            );
-        }
-    );
-
 
     container.appendChild(
         wrapper
     );
-}
 
+    if (scroll) {
 
-/* ============================================================
-   RIGHT CLICK MESSAGE MENU
-   ============================================================ */
-
-function openMessageMenu(
-    event,
-    message
-) {
-
-    closeContextMenu();
-
-    contextMessage =
-        message;
-
-    const menu =
-        document.createElement(
-            "div"
-        );
-
-    menu.id =
-        "messageContextMenu";
-
-    menu.className =
-        "context-menu";
-
-    /*
-     * EVERYONE can view profile
-     * and copy the message.
-     */
-
-    menu.innerHTML = `
-
-        <button
-            onclick="
-                viewProfile(
-                    ${message.user_id}
-                );
-                closeContextMenu();
-            "
-        >
-            👤 View Profile
-        </button>
-
-        <button
-            onclick="
-                copyMessage(
-                    ${message.id}
-                );
-                closeContextMenu();
-            "
-        >
-            📋 Copy Message
-        </button>
-
-        ${
-            message.user_id
-            === currentUser.id
-            ?
-            `
-
-                <button
-                    onclick="
-                        editMessage(
-                            ${message.id},
-                            ${JSON.stringify(
-                                message.message
-                            )}
-                        );
-                        closeContextMenu();
-                    "
-                >
-                    ✏️ Edit Message
-                </button>
-
-                <button
-                    class="danger"
-                    onclick="
-                        deleteOwnMessage(
-                            ${message.id}
-                        );
-                        closeContextMenu();
-                    "
-                >
-                    🗑️ Delete Message
-                </button>
-
-            `
-            :
-            `
-
-                <button
-                    class="danger"
-                    onclick="
-                        reportMessage(
-                            ${message.id}
-                        );
-                        closeContextMenu();
-                    "
-                >
-                    🚩 Report Message
-                </button>
-
-            `
-        }
-
-    `;
-
-    document.body.appendChild(
-        menu
-    );
-
-    let x = event.clientX;
-    let y = event.clientY;
-
-    const width =
-        menu.offsetWidth;
-
-    const height =
-        menu.offsetHeight;
-
-    if (
-        x + width
-        >
-        window.innerWidth
-    ) {
-        x =
-            window.innerWidth
-            - width
-            - 8;
-    }
-
-    if (
-        y + height
-        >
-        window.innerHeight
-    ) {
-        y =
-            window.innerHeight
-            - height
-            - 8;
-    }
-
-    menu.style.left =
-        x + "px";
-
-    menu.style.top =
-        y + "px";
-}
-
-
-function closeContextMenu() {
-
-    const menu =
-        document.getElementById(
-            "messageContextMenu"
-        );
-
-    if (menu) {
-        menu.remove();
-    }
-
-    contextMessage =
-        null;
-}
-
-
-document.addEventListener(
-    "click",
-    function(event) {
-
-        const menu =
-            document.getElementById(
-                "messageContextMenu"
-            );
-
-        if (
-            menu
-            &&
-            !menu.contains(
-                event.target
-            )
-        ) {
-            closeContextMenu();
-        }
-    }
-);
-
-
-document.addEventListener(
-    "keydown",
-    function(event) {
-
-        if (
-            event.key === "Escape"
-        ) {
-            closeContextMenu();
-        }
-    }
-);
-
-
-/* ============================================================
-   COPY MESSAGE
-   ============================================================ */
-
-async function copyMessage(
-    messageId
-) {
-
-    try {
-
-        const messages =
-            await api(
-                "/api/messages"
-            );
-
-        const message =
-            messages.find(
-                x =>
-                    x.id
-                    ===
-                    messageId
-            );
-
-        if (!message) {
-            throw new Error(
-                "Message not found"
-            );
-        }
-
-        await navigator.clipboard.writeText(
-            message.message
-        );
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
+        container.scrollTop =
+            container.scrollHeight;
     }
 }
 
 
 /* ============================================================
-   EDIT MESSAGE
-   ============================================================ */
-
-async function editMessage(
-    messageId,
-    oldMessage
-) {
-
-    const newMessage =
-        prompt(
-            "Edit message:",
-            oldMessage
-        );
-
-    if (
-        newMessage === null
-    ) {
-        return;
-    }
-
-    try {
-
-        await api(
-            "/api/messages/"
-            + messageId,
-            {
-                method: "PUT",
-                body: JSON.stringify({
-                    message:
-                        newMessage
-                })
-            }
-        );
-
-        await loadMessages();
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
-    }
-}
-
-
-/* ============================================================
-   DELETE OWN MESSAGE
-   ============================================================ */
-
-async function deleteOwnMessage(
-    messageId
-) {
-
-    if (
-        !confirm(
-            "Delete this message?"
-        )
-    ) {
-        return;
-    }
-
-    try {
-
-        await api(
-            "/api/messages/"
-            + messageId,
-            {
-                method: "DELETE"
-            }
-        );
-
-        await loadMessages();
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
-    }
-}
-
-
-/* ============================================================
-   REPORT MESSAGE
-   ============================================================ */
-
-async function reportMessage(
-    messageId
-) {
-
-    const reason =
-        prompt(
-            "Why are you reporting this message?",
-            "Other"
-        );
-
-    if (
-        reason === null
-    ) {
-        return;
-    }
-
-    const details =
-        prompt(
-            "Additional details (optional):",
-            ""
-        );
-
-    if (
-        details === null
-    ) {
-        return;
-    }
-
-    try {
-
-        await api(
-            "/api/reports",
-            {
-                method: "POST",
-                body: JSON.stringify({
-                    message_id:
-                        messageId,
-                    reason:
-                        reason,
-                    details:
-                        details
-                })
-            }
-        );
-
-        alert(
-            "Report submitted."
-        );
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
-    }
-}
-
-
-/* ============================================================
-   PROFILE
-   ============================================================ */
-
-async function viewProfile(
-    userId
-) {
-
-    try {
-
-        const profile =
-            await api(
-                "/api/users/"
-                + userId
-            );
-
-        renderProfileCard(
-            profile
-        );
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
-    }
-}
-
-
-function renderSelfProfile() {
-
-    renderProfileCard(
-        currentUser
-    );
-}
-
-
-function renderProfileCard(
-    user
-) {
-
-    const panel =
-        document.getElementById(
-            "rightPanel"
-        );
-
-    panel.innerHTML = `
-
-        <div class="profile-card">
-
-            <div class="big-avatar">
-
-                ${
-                    user.pfp
-                    ?
-                    `<img src="${escapeAttr(user.pfp)}">`
-                    :
-                    escapeHtml(
-                        user.username
-                            .charAt(0)
-                            .toUpperCase()
-                    )
-                }
-
-            </div>
-
-            <div class="profile-name">
-
-                ${escapeHtml(
-                    user.username
-                )}
-
-                ${
-                    user.role !== "user"
-                    ?
-                    `<span class="role-tag">
-                        ${escapeHtml(
-                            user.role.toUpperCase()
-                        )}
-                    </span>`
-                    :
-                    ""
-                }
-
-            </div>
-
-            <div class="status">
-
-                <span
-                    class="status-dot ${
-                        user.online
-                        ? "online"
-                        : ""
-                    }"
-                ></span>
-
-                ${
-                    user.online
-                    ? "Online"
-                    : "Offline"
-                }
-
-            </div>
-
-            ${
-                user.pronouns
-                ?
-                `<div style="color:#888">
-                    ${escapeHtml(
-                        user.pronouns
-                    )}
-                </div>`
-                :
-                ""
-            }
-
-            <div class="profile-description">
-
-                ${escapeHtml(
-                    user.description
-                    ||
-                    "No description."
-                )}
-
-            </div>
-
-            ${
-                user.id
-                ===
-                currentUser.id
-                ?
-                `
-                    <button
-                        class="action-button"
-                        onclick="editProfile()"
-                    >
-                        Edit Profile
-                    </button>
-                `
-                :
-                ""
-            }
-
-        </div>
-    `;
-}
-
-
-/* ============================================================
-   EDIT PROFILE
-   ============================================================ */
-
-function editProfile() {
-
-    openModal(`
-        <h2>Edit Profile</h2>
-
-        <input
-            id="editUsername"
-            value="${escapeAttr(
-                currentUser.username
-            )}"
-            placeholder="Username"
-        >
-
-        <input
-            id="editPfp"
-            value="${escapeAttr(
-                currentUser.pfp
-            )}"
-            placeholder="Profile picture URL"
-        >
-
-        <input
-            id="editPronouns"
-            value="${escapeAttr(
-                currentUser.pronouns
-            )}"
-            placeholder="Pronouns"
-        >
-
-        <textarea
-            id="editDescription"
-            placeholder="Description"
-        >${escapeHtml(
-            currentUser.description
-        )}</textarea>
-
-        <label>
-            <input
-                type="checkbox"
-                id="showRoleTag"
-                ${
-                    currentUser.show_role_tag
-                    ? "checked"
-                    : ""
-                }
-            >
-            Show role tag
-        </label>
-
-        <div class="modal-actions">
-
-            <button
-                class="small-button"
-                onclick="closeModal()"
-            >
-                Cancel
-            </button>
-
-            <button
-                class="action-button"
-                onclick="saveProfile()"
-            >
-                Save
-            </button>
-
-        </div>
-    `);
-}
-
-
-async function saveProfile() {
-
-    try {
-
-        await api(
-            "/api/profile",
-            {
-                method: "PUT",
-                body: JSON.stringify({
-
-                    username:
-                        document.getElementById(
-                            "editUsername"
-                        ).value,
-
-                    pfp:
-                        document.getElementById(
-                            "editPfp"
-                        ).value,
-
-                    pronouns:
-                        document.getElementById(
-                            "editPronouns"
-                        ).value,
-
-                    description:
-                        document.getElementById(
-                            "editDescription"
-                        ).value
-                })
-            }
-        );
-
-        await api(
-            "/api/role-tag",
-            {
-                method: "POST",
-                body: JSON.stringify({
-                    show:
-                        document.getElementById(
-                            "showRoleTag"
-                        ).checked
-                })
-            }
-        );
-
-        currentUser =
-            await api(
-                "/api/me"
-            );
-
-        document.getElementById(
-            "currentUser"
-        ).textContent =
-            currentUser.username;
-
-        closeModal();
-
-        renderSelfProfile();
-
-        updateRoleButtons();
-
-    } catch (err) {
-
-        alert(
-            err.message
-        );
-    }
-}
-
-
-/* ============================================================
-   FRIENDS PAGE
+   FRIENDS
    ============================================================ */
 
 async function showFriends() {
 
+    closeMobileSidebar();
+
     currentPage =
         "friends";
 
-    currentDM = null;
+    currentDM =
+        null;
+
+    if (socket) {
+        socket.emit(
+            "leave_dm",
+            {
+                user_id:
+                    currentDM
+            }
+        );
+    }
 
     document.getElementById(
         "channelName"
-    ).innerHTML =
+    ).textContent =
         "👥 Friends";
 
     document.getElementById(
@@ -4787,12 +5192,13 @@ async function showFriends() {
         "hidden"
     );
 
-    const main =
-        document.getElementById(
-            "mainContent"
-        );
+    setMobileActive(
+        "mobileFriendsButton"
+    );
 
-    main.innerHTML = `
+    document.getElementById(
+        "mainContent"
+    ).innerHTML = `
 
         <div class="panel">
 
@@ -4802,10 +5208,10 @@ async function showFriends() {
 
                 <input
                     id="friendUsername"
-                    placeholder="Enter username"
+                    placeholder="Username"
                     onkeydown="
-                        if(event.key==='Enter')
-                        addFriend()
+                        if(event.key === 'Enter')
+                            addFriend()
                     "
                 >
 
@@ -4813,18 +5219,22 @@ async function showFriends() {
                     class="action-button"
                     onclick="addFriend()"
                 >
-                    Add Friend
+                    Add
                 </button>
 
             </div>
 
-            <h3>Friend Requests</h3>
+            <h3>
+                Friend Requests
+            </h3>
 
             <div id="friendRequests">
                 Loading...
             </div>
 
-            <h3>My Friends</h3>
+            <h3>
+                My Friends
+            </h3>
 
             <div id="friends">
                 Loading...
@@ -4844,13 +5254,14 @@ async function addFriend() {
             "friendUsername"
         );
 
+    if (!input) {
+        return;
+    }
+
     const username =
         input.value.trim();
 
     if (!username) {
-        alert(
-            "Enter a username."
-        );
         return;
     }
 
@@ -4861,27 +5272,33 @@ async function addFriend() {
                 "/api/friends/add",
                 {
                     method: "POST",
-                    body: JSON.stringify({
-                        username
-                    })
+
+                    body:
+                        JSON.stringify({
+                            username
+                        })
                 }
             );
+
+        input.value =
+            "";
 
         if (
             result.status
             ===
             "accepted"
         ) {
+
             alert(
                 "Friend request accepted."
             );
+
         } else {
+
             alert(
                 "Friend request sent."
             );
         }
-
-        input.value = "";
 
         await loadFriends();
 
@@ -4928,12 +5345,22 @@ async function loadFriends() {
             return;
         }
 
-        requestsContainer.innerHTML = "";
+        requestsContainer.innerHTML =
+            "";
 
         if (!requests.length) {
 
             requestsContainer.innerHTML =
-                "<div style='color:#777'>No requests.</div>";
+                `
+                <div
+                    style="
+                        color:#777783;
+                        padding:10px 0;
+                    "
+                >
+                    No pending requests.
+                </div>
+                `;
 
         } else {
 
@@ -4955,10 +5382,15 @@ async function loadFriends() {
                     <div class="friend-left">
 
                         <div class="avatar">
+
                             ${
                                 request.pfp
                                 ?
-                                `<img src="${escapeAttr(request.pfp)}">`
+                                `<img
+                                    src="${escapeAttr(
+                                        request.pfp
+                                    )}"
+                                >`
                                 :
                                 escapeHtml(
                                     request.username
@@ -4966,22 +5398,26 @@ async function loadFriends() {
                                         .toUpperCase()
                                 )
                             }
+
                         </div>
 
                         <div>
+
                             <b>
                                 ${escapeHtml(
                                     request.username
                                 )}
                             </b>
 
-                            <div>
-                                ${
-                                    request.online
-                                    ? "🟢 Online"
-                                    : "⚫ Offline"
-                                }
+                            <div
+                                style="
+                                    color:#777783;
+                                    font-size:12px;
+                                "
+                            >
+                                Friend request
                             </div>
+
                         </div>
 
                     </div>
@@ -5004,12 +5440,22 @@ async function loadFriends() {
             }
         }
 
-        friendsContainer.innerHTML = "";
+        friendsContainer.innerHTML =
+            "";
 
         if (!friends.length) {
 
             friendsContainer.innerHTML =
-                "<div style='color:#777'>No friends yet.</div>";
+                `
+                <div
+                    style="
+                        color:#777783;
+                        padding:10px 0;
+                    "
+                >
+                    No friends yet.
+                </div>
+                `;
 
         } else {
 
@@ -5043,7 +5489,11 @@ async function loadFriends() {
                             ${
                                 friend.pfp
                                 ?
-                                `<img src="${escapeAttr(friend.pfp)}">`
+                                `<img
+                                    src="${escapeAttr(
+                                        friend.pfp
+                                    )}"
+                                >`
                                 :
                                 escapeHtml(
                                     friend.username
@@ -5094,7 +5544,6 @@ async function loadFriends() {
                     >
                         Message
                     </button>
-
                 `;
 
                 friendsContainer.appendChild(
@@ -5120,7 +5569,8 @@ async function acceptFriend(
 
         await api(
             "/api/friends/accept/"
-            + requestId,
+            +
+            requestId,
             {
                 method: "POST"
             }
@@ -5153,7 +5603,12 @@ async function loadFriendList() {
                 "friendList"
             );
 
-        container.innerHTML = "";
+        if (!container) {
+            return;
+        }
+
+        container.innerHTML =
+            "";
 
         for (
             const friend
@@ -5178,10 +5633,17 @@ async function loadFriendList() {
                     }"
                 ></span>
 
-                ${escapeHtml(
-                    friend.username
-                )}
-
+                <span
+                    style="
+                        overflow:hidden;
+                        text-overflow:ellipsis;
+                        white-space:nowrap;
+                    "
+                >
+                    ${escapeHtml(
+                        friend.username
+                    )}
+                </span>
             `;
 
             item.onclick =
@@ -5194,7 +5656,12 @@ async function loadFriendList() {
             );
         }
 
-    } catch {}
+    } catch (err) {
+
+        console.error(
+            err
+        );
+    }
 }
 
 
@@ -5206,8 +5673,27 @@ async function loadDM(
     userId
 ) {
 
+    closeMobileSidebar();
+
     currentPage =
         "chat";
+
+    if (
+        socket
+        &&
+        currentDM
+        &&
+        currentDM !== userId
+    ) {
+
+        socket.emit(
+            "leave_dm",
+            {
+                user_id:
+                    currentDM
+            }
+        );
+    }
 
     currentDM =
         userId;
@@ -5215,7 +5701,8 @@ async function loadDM(
     const profile =
         await api(
             "/api/users/"
-            + userId
+            +
+            userId
         );
 
     document.getElementById(
@@ -5243,7 +5730,8 @@ async function loadDM(
     const messages =
         await api(
             "/api/dm/"
-            + userId
+            +
+            userId
         );
 
     const container =
@@ -5251,85 +5739,37 @@ async function loadDM(
             "mainContent"
         );
 
-    container.innerHTML = "";
+    container.innerHTML =
+        "";
 
     for (
         const message
         of messages
     ) {
 
-        const wrapper =
-            document.createElement(
-                "div"
-            );
-
-        wrapper.className =
-            "message";
-
-        wrapper.innerHTML = `
-
-            <div class="avatar">
-
-                ${
-                    message.pfp
-                    ?
-                    `<img src="${escapeAttr(message.pfp)}">`
-                    :
-                    escapeHtml(
-                        message.username
-                            .charAt(0)
-                            .toUpperCase()
-                    )
-                }
-
-            </div>
-
-            <div class="message-content">
-
-                <div class="message-header">
-
-                    <span class="username">
-                        ${escapeHtml(
-                            message.username
-                        )}
-                    </span>
-
-                    <span class="timestamp">
-                        ${new Date(
-                            message.created_at
-                        ).toLocaleTimeString()}
-                    </span>
-
-                </div>
-
-                <div class="message-text">
-
-                    ${escapeHtml(
-                        message.message
-                    )}
-
-                    ${
-                        message.edited
-                        ?
-                        `<span class="edited">
-                            (edited)
-                        </span>`
-                        :
-                        ""
-                    }
-
-                </div>
-
-            </div>
-        `;
-
-        container.appendChild(
-            wrapper
+        appendMessage(
+            message,
+            false
         );
     }
 
     container.scrollTop =
         container.scrollHeight;
+
+    if (socket) {
+
+        socket.emit(
+            "join_dm",
+            {
+                user_id:
+                    userId
+            }
+        );
+    }
+
+    setMobileActive(
+        "mobileChatButton"
+    );
 
     renderProfileCard(
         profile
@@ -5351,25 +5791,25 @@ async function sendMessage() {
         return;
     }
 
+    input.disabled =
+        true;
+
     try {
 
         if (currentDM) {
 
             await api(
                 "/api/dm/"
-                + currentDM,
+                +
+                currentDM,
                 {
                     method: "POST",
-                    body: JSON.stringify({
-                        message
-                    })
+
+                    body:
+                        JSON.stringify({
+                            message
+                        })
                 }
-            );
-
-            input.value = "";
-
-            await loadDM(
-                currentDM
             );
 
         } else {
@@ -5378,16 +5818,544 @@ async function sendMessage() {
                 "/api/messages",
                 {
                     method: "POST",
-                    body: JSON.stringify({
-                        message
-                    })
+
+                    body:
+                        JSON.stringify({
+                            message
+                        })
                 }
             );
-
-            input.value = "";
-
-            await loadMessages();
         }
+
+        input.value =
+            "";
+
+    } catch (err) {
+
+        alert(
+            err.message
+        );
+
+    } finally {
+
+        input.disabled =
+            false;
+
+        input.focus();
+    }
+}
+
+
+/* ============================================================
+   PROFILE
+   ============================================================ */
+
+async function showProfile() {
+
+    closeMobileSidebar();
+
+    currentPage =
+        "profile";
+
+    currentDM =
+        null;
+
+    document.getElementById(
+        "channelName"
+    ).textContent =
+        "👤 Profile";
+
+    document.getElementById(
+        "composer"
+    ).classList.add(
+        "hidden"
+    );
+
+    setMobileActive(
+        "mobileProfileButton"
+    );
+
+    document.getElementById(
+        "mainContent"
+    ).innerHTML = `
+
+        <div class="panel">
+
+            <h2>Your Profile</h2>
+
+            <div
+                id="selfProfile"
+                class="panel-card"
+            >
+                Loading...
+            </div>
+
+            <button
+                class="action-button"
+                onclick="editProfile()"
+            >
+                Edit Profile
+            </button>
+
+        </div>
+    `;
+
+    renderSelfProfile();
+}
+
+
+function renderSelfProfile() {
+
+    const container =
+        document.getElementById(
+            "selfProfile"
+        );
+
+    if (!container || !currentUser) {
+        return;
+    }
+
+    const avatar =
+        currentUser.pfp
+        ?
+        `
+        <img
+            src="${escapeAttr(
+                currentUser.pfp
+            )}"
+        >
+        `
+        :
+        escapeHtml(
+            currentUser.username
+                .charAt(0)
+                .toUpperCase()
+        );
+
+    container.innerHTML = `
+
+        <div
+            style="
+                display:flex;
+                gap:15px;
+                align-items:center;
+            "
+        >
+
+            <div
+                class="avatar"
+                style="
+                    width:70px;
+                    height:70px;
+                    min-width:70px;
+                "
+            >
+                ${avatar}
+            </div>
+
+            <div>
+
+                <h2
+                    style="
+                        margin:0;
+                    "
+                >
+                    ${escapeHtml(
+                        currentUser.username
+                    )}
+                </h2>
+
+                <div
+                    style="
+                        color:#a65cff;
+                        font-size:12px;
+                        font-weight:800;
+                    "
+                >
+                    ${escapeHtml(
+                        currentUser.role
+                    ).toUpperCase()}
+                </div>
+
+                ${
+                    currentUser.pronouns
+                    ?
+                    `
+                    <div
+                        style="
+                            color:#777783;
+                            margin-top:4px;
+                        "
+                    >
+                        ${escapeHtml(
+                            currentUser.pronouns
+                        )}
+                    </div>
+                    `
+                    :
+                    ""
+                }
+
+            </div>
+
+        </div>
+
+        <p>
+            ${escapeHtml(
+                currentUser.description
+                ||
+                "No description."
+            )}
+        </p>
+    `;
+}
+
+
+function renderProfileCard(
+    profile
+) {
+
+    const right =
+        document.getElementById(
+            "rightPanel"
+        );
+
+    if (!right) {
+        return;
+    }
+
+    right.innerHTML = `
+
+        <div
+            style="
+                padding:20px;
+            "
+        >
+
+            <div
+                class="avatar"
+                style="
+                    width:80px;
+                    height:80px;
+                "
+            >
+
+                ${
+                    profile.pfp
+                    ?
+                    `<img
+                        src="${escapeAttr(
+                            profile.pfp
+                        )}"
+                    >`
+                    :
+                    escapeHtml(
+                        profile.username
+                            .charAt(0)
+                            .toUpperCase()
+                    )
+                }
+
+            </div>
+
+            <h2>
+                ${escapeHtml(
+                    profile.username
+                )}
+            </h2>
+
+            <div>
+
+                <span
+                    class="status-dot ${
+                        profile.online
+                        ? "online"
+                        : ""
+                    }"
+                ></span>
+
+                ${
+                    profile.online
+                    ? "Online"
+                    : "Offline"
+                }
+
+            </div>
+
+            ${
+                profile.pronouns
+                ?
+                `
+                <p>
+                    ${escapeHtml(
+                        profile.pronouns
+                    )}
+                </p>
+                `
+                :
+                ""
+            }
+
+            <p
+                style="
+                    color:#9999a6;
+                "
+            >
+                ${escapeHtml(
+                    profile.description
+                    ||
+                    "No description."
+                )}
+            </p>
+
+        </div>
+    `;
+}
+
+
+async function viewProfile(
+    userId
+) {
+
+    try {
+
+        const profile =
+            await api(
+                "/api/users/"
+                +
+                userId
+            );
+
+        openModal(`
+            <div
+                class="avatar"
+                style="
+                    width:80px;
+                    height:80px;
+                "
+            >
+                ${
+                    profile.pfp
+                    ?
+                    `<img
+                        src="${escapeAttr(
+                            profile.pfp
+                        )}"
+                    >`
+                    :
+                    escapeHtml(
+                        profile.username
+                            .charAt(0)
+                            .toUpperCase()
+                    )
+                }
+            </div>
+
+            <h2>
+                ${escapeHtml(
+                    profile.username
+                )}
+            </h2>
+
+            <div>
+                <span
+                    class="status-dot ${
+                        profile.online
+                        ? "online"
+                        : ""
+                    }"
+                ></span>
+                ${
+                    profile.online
+                    ? "Online"
+                    : "Offline"
+                }
+            </div>
+
+            <p>
+                ${escapeHtml(
+                    profile.description
+                    ||
+                    "No description."
+                )}
+            </p>
+
+            <button
+                class="action-button"
+                onclick="
+                    closeModal();
+                    loadDM(${profile.id});
+                "
+            >
+                Message
+            </button>
+        `);
+
+    } catch (err) {
+
+        alert(
+            err.message
+        );
+    }
+}
+
+
+function editProfile() {
+
+    openModal(`
+
+        <h2>
+            Edit Profile
+        </h2>
+
+        <label>
+            Username
+        </label>
+
+        <input
+            id="editUsername"
+            value="${escapeAttr(
+                currentUser.username
+            )}"
+        >
+
+        <label>
+            Profile Picture URL
+        </label>
+
+        <input
+            id="editPfp"
+            value="${escapeAttr(
+                currentUser.pfp
+            )}"
+            placeholder="https://..."
+        >
+
+        <label>
+            Pronouns
+        </label>
+
+        <input
+            id="editPronouns"
+            value="${escapeAttr(
+                currentUser.pronouns
+            )}"
+        >
+
+        <label>
+            Description
+        </label>
+
+        <textarea
+            id="editDescription"
+        >${escapeHtml(
+            currentUser.description
+        )}</textarea>
+
+        <label>
+
+            <input
+                type="checkbox"
+                id="showRoleTag"
+                ${
+                    currentUser.show_role_tag
+                    ?
+                    "checked"
+                    :
+                    ""
+                }
+            >
+
+            Show role tag
+
+        </label>
+
+        <div class="modal-actions">
+
+            <button
+                class="small-button"
+                onclick="closeModal()"
+            >
+                Cancel
+            </button>
+
+            <button
+                class="action-button"
+                onclick="saveProfile()"
+            >
+                Save
+            </button>
+
+        </div>
+    `);
+}
+
+
+async function saveProfile() {
+
+    try {
+
+        await api(
+            "/api/profile",
+            {
+                method: "PUT",
+
+                body:
+                    JSON.stringify({
+
+                        username:
+                            document.getElementById(
+                                "editUsername"
+                            ).value,
+
+                        pfp:
+                            document.getElementById(
+                                "editPfp"
+                            ).value,
+
+                        pronouns:
+                            document.getElementById(
+                                "editPronouns"
+                            ).value,
+
+                        description:
+                            document.getElementById(
+                                "editDescription"
+                            ).value
+                    })
+            }
+        );
+
+        await api(
+            "/api/role-tag",
+            {
+                method: "POST",
+
+                body:
+                    JSON.stringify({
+                        show:
+                            document.getElementById(
+                                "showRoleTag"
+                            ).checked
+                    })
+            }
+        );
+
+        currentUser =
+            await api(
+                "/api/me"
+            );
+
+        document.getElementById(
+            "currentUser"
+        ).textContent =
+            currentUser.username;
+
+        closeModal();
+
+        renderSelfProfile();
+
+        updateRoleButtons();
 
     } catch (err) {
 
@@ -5404,14 +6372,17 @@ async function sendMessage() {
 
 async function showModeration() {
 
+    closeMobileSidebar();
+
     currentPage =
         "moderation";
 
-    currentDM = null;
+    currentDM =
+        null;
 
     document.getElementById(
         "channelName"
-    ).innerHTML =
+    ).textContent =
         "🛡️ Moderation";
 
     document.getElementById(
@@ -5420,12 +6391,9 @@ async function showModeration() {
         "hidden"
     );
 
-    const main =
-        document.getElementById(
-            "mainContent"
-        );
-
-    main.innerHTML = `
+    document.getElementById(
+        "mainContent"
+    ).innerHTML = `
 
         <div class="panel">
 
@@ -5434,8 +6402,9 @@ async function showModeration() {
             <div
                 style="
                     display:flex;
+                    flex-wrap:wrap;
                     gap:8px;
-                    margin-bottom:15px
+                    margin-bottom:15px;
                 "
             >
 
@@ -5514,15 +6483,16 @@ async function loadReports(
             return;
         }
 
-        container.innerHTML = "";
+        container.innerHTML =
+            "";
 
         if (!reports.length) {
 
             container.innerHTML =
                 `
-                    <div class="panel-card">
-                        No reports found.
-                    </div>
+                <div class="panel-card">
+                    No reports found.
+                </div>
                 `;
 
             return;
@@ -5559,7 +6529,8 @@ async function loadReports(
 
                 <hr
                     style="
-                        border-color:#292936
+                        border-color:#292936;
+                        margin:12px 0;
                     "
                 >
 
@@ -5589,7 +6560,8 @@ async function loadReports(
                 <div
                     style="margin-top:8px"
                 >
-                    <b>Details:</b><br>
+                    <b>Details:</b>
+                    <br>
                     ${escapeHtml(
                         report.details
                         ||
@@ -5601,48 +6573,26 @@ async function loadReports(
                     report.reported_message
                     ?
                     `
-                        <div
-                            style="
-                                margin-top:10px;
-                                padding:10px;
-                                background:#0c0c11;
-                                border-radius:8px
-                            "
-                        >
+                    <div
+                        style="
+                            margin-top:10px;
+                            padding:10px;
+                            background:#0c0c11;
+                            border-radius:8px;
+                        "
+                    >
 
-                            <b>
-                                Reported message:
-                            </b>
+                        <b>
+                            Reported message:
+                        </b>
 
-                            <br>
+                        <br>
 
-                            ${escapeHtml(
-                                report.reported_message
-                            )}
+                        ${escapeHtml(
+                            report.reported_message
+                        )}
 
-                        </div>
-                    `
-                    :
-                    ""
-                }
-
-                ${
-                    report.moderator_note
-                    ?
-                    `
-                        <div
-                            style="
-                                margin-top:8px
-                            "
-                        >
-                            <b>
-                                Moderator note:
-                            </b>
-
-                            ${escapeHtml(
-                                report.moderator_note
-                            )}
-                        </div>
+                    </div>
                     `
                     :
                     ""
@@ -5654,78 +6604,77 @@ async function loadReports(
                     "open"
                     ?
                     `
+                    <div
+                        class="modal-actions"
+                    >
 
-                        <div
-                            class="modal-actions"
+                        ${
+                            report.message_id
+                            ?
+                            `
+                            <button
+                                class="
+                                    small-button
+                                    danger
+                                "
+                                onclick="
+                                    deleteReported(
+                                        ${report.message_id}
+                                    )
+                                "
+                            >
+                                Delete Message
+                            </button>
+                            `
+                            :
+                            ""
+                        }
+
+                        ${
+                            report.reported_user_id
+                            ?
+                            `
+                            <button
+                                class="
+                                    small-button
+                                    danger
+                                "
+                                onclick="
+                                    banReported(
+                                        ${report.reported_user_id}
+                                    )
+                                "
+                            >
+                                Ban User
+                            </button>
+                            `
+                            :
+                            ""
+                        }
+
+                        <button
+                            class="small-button"
+                            onclick="
+                                resolveReport(
+                                    ${report.id}
+                                )
+                            "
                         >
+                            Resolve
+                        </button>
 
-                            ${
-                                report.message_id
-                                ?
-                                `
-                                    <button
-                                        class="
-                                            small-button
-                                            danger
-                                        "
-                                        onclick="
-                                            deleteReported(
-                                                ${report.message_id}
-                                            )
-                                        "
-                                    >
-                                        Delete Message
-                                    </button>
-                                `
-                                :
-                                ""
-                            }
+                        <button
+                            class="small-button"
+                            onclick="
+                                dismissReport(
+                                    ${report.id}
+                                )
+                            "
+                        >
+                            Dismiss
+                        </button>
 
-                            ${
-                                report.reported_user_id
-                                ?
-                                `
-                                    <button
-                                        class="
-                                            small-button
-                                            danger
-                                        "
-                                        onclick="
-                                            banReported(
-                                                ${report.reported_user_id}
-                                            )
-                                        "
-                                    >
-                                        Ban User
-                                    </button>
-                                `
-                                :
-                                ""
-                            }
-
-                            <button
-                                class="small-button"
-                                onclick="
-                                    resolveReport(
-                                        ${report.id}
-                                    )
-                                "
-                            >
-                                Resolve
-                            </button>
-
-                            <button
-                                class="small-button"
-                                onclick="
-                                    dismissReport(
-                                        ${report.id}
-                                    )
-                                "
-                            >
-                                Dismiss
-                            </button>
-
-                        </div>
+                    </div>
                     `
                     :
                     ""
@@ -5755,13 +6704,16 @@ async function deleteReported(
 
         await api(
             "/api/mod/message/"
-            + id,
+            +
+            id,
             {
                 method: "DELETE"
             }
         );
 
-        await showModeration();
+        await loadReports(
+            "open"
+        );
 
     } catch (err) {
 
@@ -5788,13 +6740,16 @@ async function banReported(
 
         await api(
             "/api/mod/ban/"
-            + id,
+            +
+            id,
             {
                 method: "POST"
             }
         );
 
-        await showModeration();
+        await loadReports(
+            "open"
+        );
 
     } catch (err) {
 
@@ -5825,17 +6780,23 @@ async function resolveReport(
 
         await api(
             "/api/reports/"
-            + id
-            + "/resolve",
+            +
+            id
+            +
+            "/resolve",
             {
                 method: "POST",
-                body: JSON.stringify({
-                    note
-                })
+
+                body:
+                    JSON.stringify({
+                        note
+                    })
             }
         );
 
-        await showModeration();
+        await loadReports(
+            "open"
+        );
 
     } catch (err) {
 
@@ -5866,17 +6827,23 @@ async function dismissReport(
 
         await api(
             "/api/reports/"
-            + id
-            + "/dismiss",
+            +
+            id
+            +
+            "/dismiss",
             {
                 method: "POST",
-                body: JSON.stringify({
-                    note
-                })
+
+                body:
+                    JSON.stringify({
+                        note
+                    })
             }
         );
 
-        await showModeration();
+        await loadReports(
+            "open"
+        );
 
     } catch (err) {
 
@@ -5893,14 +6860,17 @@ async function dismissReport(
 
 async function showOwner() {
 
+    closeMobileSidebar();
+
     currentPage =
         "owner";
 
-    currentDM = null;
+    currentDM =
+        null;
 
     document.getElementById(
         "channelName"
-    ).innerHTML =
+    ).textContent =
         "⚙️ Owner Panel";
 
     document.getElementById(
@@ -5909,16 +6879,15 @@ async function showOwner() {
         "hidden"
     );
 
-    const main =
-        document.getElementById(
-            "mainContent"
-        );
-
-    main.innerHTML = `
+    document.getElementById(
+        "mainContent"
+    ).innerHTML = `
 
         <div class="panel">
 
-            <h2>Users</h2>
+            <h2>
+                Users
+            </h2>
 
             <div id="ownerUsers">
                 Loading...
@@ -5927,85 +6896,92 @@ async function showOwner() {
         </div>
     `;
 
-    const users =
-        await api(
-            "/api/mod/users"
-        );
+    try {
 
-    const container =
-        document.getElementById(
-            "ownerUsers"
-        );
-
-    container.innerHTML = "";
-
-    for (
-        const user
-        of users
-    ) {
-
-        const card =
-            document.createElement(
-                "div"
+        const users =
+            await api(
+                "/api/mod/users"
             );
 
-        card.className =
-            "panel-card";
+        const container =
+            document.getElementById(
+                "ownerUsers"
+            );
 
-        card.innerHTML = `
+        container.innerHTML =
+            "";
 
-            <div class="panel-row">
+        for (
+            const user
+            of users
+        ) {
 
-                <div>
+            const card =
+                document.createElement(
+                    "div"
+                );
 
-                    <strong>
-                        ${escapeHtml(
-                            user.username
-                        )}
-                    </strong>
+            card.className =
+                "panel-card";
 
-                    <div>
-                        Role:
-                        ${escapeHtml(
-                            user.role
-                        )}
-                    </div>
+            card.innerHTML = `
 
-                    <div
-                        style="
-                            color:${
-                                user.online
-                                ? "#45d483"
-                                : "#666"
-                            }
-                        "
-                    >
-                        ●
-                        ${
-                            user.online
-                            ? "Online"
-                            : "Offline"
-                        }
-                    </div>
+                <div class="panel-row">
 
                     <div>
-                        ${
-                            user.banned
-                            ? "🔴 Banned"
-                            : "🟢 Active"
-                        }
-                    </div>
 
-                </div>
-
-                ${
-                    user.role
-                    !==
-                    "owner"
-                    ?
-                    `
+                        <strong>
+                            ${escapeHtml(
+                                user.username
+                            )}
+                        </strong>
 
                         <div>
+                            Role:
+                            ${escapeHtml(
+                                user.role
+                            )}
+                        </div>
+
+                        <div>
+                            <span
+                                class="status-dot ${
+                                    user.online
+                                    ? "online"
+                                    : ""
+                                }"
+                            ></span>
+
+                            ${
+                                user.online
+                                ? "Online"
+                                : "Offline"
+                            }
+                        </div>
+
+                        <div>
+                            ${
+                                user.banned
+                                ? "🔴 Banned"
+                                : "🟢 Active"
+                            }
+                        </div>
+
+                    </div>
+
+                    ${
+                        user.role
+                        !==
+                        "owner"
+                        ?
+                        `
+                        <div
+                            style="
+                                display:flex;
+                                flex-wrap:wrap;
+                                gap:5px;
+                            "
+                        >
 
                             <button
                                 class="small-button"
@@ -6063,17 +7039,23 @@ async function showOwner() {
                             </button>
 
                         </div>
+                        `
+                        :
+                        "<b>OWNER</b>"
+                    }
 
-                    `
-                    :
-                    "<b>OWNER</b>"
-                }
+                </div>
+            `;
 
-            </div>
-        `;
+            container.appendChild(
+                card
+            );
+        }
 
-        container.appendChild(
-            card
+    } catch (err) {
+
+        alert(
+            err.message
         );
     }
 }
@@ -6107,13 +7089,16 @@ async function changeRole(
 
         await api(
             "/api/admin/role/"
-            + id,
+            +
+            id,
             {
                 method: "POST",
-                body: JSON.stringify({
-                    role:
-                        role.toLowerCase()
-                })
+
+                body:
+                    JSON.stringify({
+                        role:
+                            role.toLowerCase()
+                    })
             }
         );
 
@@ -6139,10 +7124,12 @@ async function toggleBan(
             banned
             ?
             "/api/mod/unban/"
-            + id
+            +
+            id
             :
             "/api/mod/ban/"
-            + id,
+            +
+            id,
             {
                 method: "POST"
             }
@@ -6175,7 +7162,8 @@ async function ipBan(
 
         await api(
             "/api/owner/ip-ban/"
-            + id,
+            +
+            id,
             {
                 method: "POST"
             }
@@ -6208,7 +7196,8 @@ async function deleteAccount(
 
         await api(
             "/api/owner/account/"
-            + id,
+            +
+            id,
             {
                 method: "DELETE"
             }
@@ -6222,57 +7211,6 @@ async function deleteAccount(
             err.message
         );
     }
-}
-
-
-/* ============================================================
-   PROFILE PAGE
-   ============================================================ */
-
-async function showProfile() {
-
-    currentPage =
-        "profile";
-
-    currentDM = null;
-
-    document.getElementById(
-        "channelName"
-    ).innerHTML =
-        "👤 Profile";
-
-    document.getElementById(
-        "composer"
-    ).classList.add(
-        "hidden"
-    );
-
-    const main =
-        document.getElementById(
-            "mainContent"
-        );
-
-    main.innerHTML = `
-
-        <div class="panel">
-
-            <h2>Your Profile</h2>
-
-            <div class="panel-card">
-
-                <button
-                    class="action-button"
-                    onclick="editProfile()"
-                >
-                    Edit Profile
-                </button>
-
-            </div>
-
-        </div>
-    `;
-
-    renderSelfProfile();
 }
 
 
@@ -6314,8 +7252,11 @@ document.getElementById(
     function(event) {
 
         if (
-            event.target === this
+            event.target
+            ===
+            this
         ) {
+
             closeModal();
         }
     }
@@ -6323,88 +7264,164 @@ document.getElementById(
 
 
 /* ============================================================
-   AUTO REFRESH
+   MOBILE
    ============================================================ */
 
-setInterval(
-    async function() {
+function toggleMobileSidebar() {
 
-        if (
-            !token
-            ||
-            !currentUser
-        ) {
-            return;
-        }
+    document.querySelector(
+        ".sidebar"
+    ).classList.toggle(
+        "mobile-open"
+    );
+}
 
-        try {
 
-            /*
-             * Only refresh the page that
-             * is currently being viewed.
-             */
+function closeMobileSidebar() {
 
-            if (
-                currentPage
-                ===
-                "chat"
-            ) {
+    const sidebar =
+        document.querySelector(
+            ".sidebar"
+        );
 
-                if (
-                    currentDM
-                ) {
+    if (sidebar) {
 
-                    await loadDM(
-                        currentDM
-                    );
+        sidebar.classList.remove(
+            "mobile-open"
+        );
+    }
+}
 
-                } else {
 
-                    await loadMessages();
-                }
+function setMobileActive(
+    id
+) {
+
+    document
+        .querySelectorAll(
+            ".mobile-nav button"
+        )
+        .forEach(
+            button => {
+                button.classList.remove(
+                    "active"
+                );
             }
+        );
 
-            else if (
-                currentPage
-                ===
-                "friends"
-            ) {
+    const button =
+        document.getElementById(
+            id
+        );
 
-                await loadFriends();
-
-                await loadFriendList();
-            }
-
-            /*
-             * Moderation and Owner are
-             * intentionally NOT replaced
-             * every few seconds.
-             */
-
-        } catch (error) {
-
-            console.error(
-                "Auto refresh:",
-                error
-            );
-        }
-
-    },
-    15000
-);
+    if (button) {
+        button.classList.add(
+            "active"
+        );
+    }
+}
 
 
 /* ============================================================
-   START IF ALREADY LOGGED IN
+   LOGOUT
+   ============================================================ */
+
+async function logout() {
+
+    try {
+
+        if (token) {
+
+            await api(
+                "/api/logout",
+                {
+                    method: "POST"
+                }
+            );
+        }
+
+    } catch {}
+
+    if (socket) {
+
+        socket.disconnect();
+
+        socket =
+            null;
+    }
+
+    token =
+        null;
+
+    currentUser =
+        null;
+
+    currentDM =
+        null;
+
+    localStorage.removeItem(
+        "spookchat_token"
+    );
+
+    document.getElementById(
+        "app"
+    ).classList.add(
+        "hidden"
+    );
+
+    document.getElementById(
+        "authScreen"
+    ).classList.remove(
+        "hidden"
+    );
+}
+
+
+/* ============================================================
+   INITIAL LOAD
    ============================================================ */
 
 if (token) {
+
     startApp();
+
+} else {
+
+    document.getElementById(
+        "authScreen"
+    ).classList.remove(
+        "hidden"
+    );
 }
+
+
+/* ============================================================
+   REQUEST NOTIFICATIONS
+   ============================================================ */
+
+setTimeout(
+    () => {
+
+        if (
+            "Notification"
+            in window
+            &&
+            Notification.permission
+            ===
+            "default"
+        ) {
+
+            Notification.requestPermission();
+        }
+
+    },
+    3000
+);
 
 </script>
 
 </body>
+
 </html>
 """
 
@@ -6415,6 +7432,7 @@ if (token) {
 
 @app.get("/")
 def index():
+
     return render_template_string(
         HTML
     )
@@ -6433,22 +7451,27 @@ if __name__ == "__main__":
     print("=" * 60)
     print("SPOOKCHAT")
     print("=" * 60)
+
     print(
         "Website: http://127.0.0.1:5000"
     )
+
     print(
         "Owner:",
         OWNER_USERNAME
     )
+
     print(
-        "Owner password:",
-        OWNER_PASSWORD
+        "Real-time chat: ENABLED"
     )
+
     print("=" * 60)
     print()
 
-    app.run(
+    socketio.run(
+        app,
         host="0.0.0.0",
         port=5000,
-        debug=False
+        debug=False,
+        allow_unsafe_werkzeug=True
     )
