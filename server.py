@@ -21,8 +21,8 @@ DATABASE = os.environ.get(
 )
 
 OWNER_USERNAME = os.environ.get(
-    "SPOOKCHAT_OWNER_USERNAME",
-    "JAYDEN"
+    "",
+    ""
 )
 
 # IMPORTANT:
@@ -34,8 +34,8 @@ OWNER_USERNAME = os.environ.get(
 #
 # This uses SPOOKCHAT_OWNER_PASSWORD correctly.
 OWNER_PASSWORD = os.environ.get(
-    "SPOOKCHAT_OWNER_PASSWORD",
-    "2011BeT20211"
+    "",
+    ""
 )
 
 ONLINE_SECONDS = 60
