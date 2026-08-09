@@ -2,3 +2,5 @@ Flask
 flask-cors
 Werkzeug
 gunicorn
+flask-socketio
+simple-websocket
